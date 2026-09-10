@@ -69,3 +69,6 @@ crashlytics-build.properties
 
 # Non-shared project settings
 [Oo]verrides/
+
+# Android/CMake build temp files
+.utmp/
