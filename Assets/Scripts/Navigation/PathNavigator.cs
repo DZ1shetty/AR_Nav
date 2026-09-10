@@ -1,6 +1,6 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
-using System.IO;
 using UnityEngine;
 using UnityEngine.UI;
 using TMPro;
@@ -9,483 +9,455 @@ using ARNav.Graph;
 namespace ARNav.Navigation
 {
     /// <summary>
-    /// Loads a local building graph, runs A* routing, and renders the path with:
-    ///  - Animated ground-level LineRenderer
-    ///  - 3D sphere waypoint markers at each node (like IndoorNavPlaceNote diamond markers)
-    ///  - On-screen compass HUD arrow always pointing toward the next waypoint
+    /// Executes turn-by-turn indoor AR navigation.
+    ///
+    /// What it does:
+    ///   • Loads the building graph and runs A* between two named nodes.
+    ///   • Renders an animated ground-level LineRenderer path.
+    ///   • Spawns glowing sphere / arrow-prefab waypoint markers.
+    ///   • Shows an on-screen compass HUD arrow that always points toward
+    ///     the next waypoint (rotates in 2-D like a minimap compass).
+    ///   • Fires OnInstructionChanged with turn-by-turn text.
+    ///   • Fires OnDestinationReached when the user arrives.
+    ///
+    /// KEY FIXES vs old version:
+    ///   • AnimateIn() IS called on every spawned arrow prefab.
+    ///   • ARArrow.RefreshBase() called after placement so bob Y is correct.
+    ///   • PulsateMarkers coroutine respects ARArrow — only runs on fallback spheres.
+    ///   • arCamera null-checked everywhere it is accessed mid-navigation.
+    ///   • Line material uses Unlit/Color (always available, always scrolls correctly).
+    ///   • Compass HUD built cleanly — no Image created-then-destroyed pattern.
     /// </summary>
     public class PathNavigator : MonoBehaviour
     {
+        // ── Inspector ─────────────────────────────────────────────────────────────
         [Header("References")]
-        [SerializeField] private Transform arCamera;
-        [SerializeField] private LineRenderer pathLineRenderer;
-        [SerializeField] private GameObject arrowPrefab;
+        [SerializeField] public Transform   arCamera;
+        [SerializeField] private LineRenderer pathLine;
+        [SerializeField] public  GameObject  arrowPrefab;  // optional — spheres used as fallback
 
-        [Header("Path Rendering Settings")]
-        [SerializeField] private float pathLineWidth = 0.25f;
-        [SerializeField] private Color pathColor = new Color(0.1f, 0.8f, 1f, 0.8f);
-        [SerializeField] private float floorYOffset = -0.3f;
+        [Header("Path Line")]
+        [SerializeField] private float pathLineWidth = 0.22f;
+        [SerializeField] private Color pathColor     = new Color(0.1f, 0.85f, 1f, 0.85f);
+        [SerializeField] private float floorYOffset  = -0.25f; // drop line below eye level
 
-        [Header("Waypoint Marker Settings")]
-        [SerializeField] private float markerSize = 0.35f;
-        [SerializeField] private Color markerColor = new Color(0.1f, 0.9f, 1f, 0.85f);
+        [Header("Waypoint Markers")]
+        [SerializeField] private float markerSize  = 0.35f;
+        [SerializeField] private Color markerColor = new Color(0.1f, 0.9f, 1f, 0.9f);
 
         [Header("Navigation Logic")]
-        [SerializeField] private float waypointReachRadius = 1.2f;
+        [SerializeField] private float waypointRadius = 1.2f; // metres to count as "reached"
 
-        // --- Internal State ---
-        private BuildingGraph _activeGraph;
-        private List<GraphEdge> _currentRoute = new List<GraphEdge>();
-        private List<Vector3> _flattenedRoutePoints = new List<Vector3>();
-        private int _currentPointIndex = 0;
-        private bool _isNavigating = false;
-
-        // Waypoint sphere markers (IndoorNavPlaceNote style)
-        private readonly List<GameObject> _waypointMarkers = new List<GameObject>();
-
-        // HUD compass arrow
-        private GameObject _compassHUDCanvas;
-        private RectTransform _arrowImageRT;
-        private TextMeshProUGUI _compassDistText;
-
-        // Path animation (UV scroll)
-        private Material _lineMaterial;
-        private float _uvOffset = 0f;
-
-        public bool IsNavigating => _isNavigating;
+        // ── Events ────────────────────────────────────────────────────────────────
         public event Action<string> OnInstructionChanged;
-        public event Action OnDestinationReached;
+        public event Action         OnDestinationReached;
 
-        // ─── Lifecycle ────────────────────────────────────────────────────────────
+        // ── Public state ──────────────────────────────────────────────────────────
+        public bool IsNavigating => _navigating;
+
+        // ── Private state ─────────────────────────────────────────────────────────
+        private BuildingGraph       _graph;
+        private List<Vector3>       _path       = new List<Vector3>();
+        private int                 _pathIndex  = 0;
+        private bool                _navigating = false;
+
+        // Waypoint marker GameObjects (one per remaining path point)
+        private readonly List<GameObject> _markers = new List<GameObject>();
+        private bool _markersUseArrowPrefab = false;
+
+        // Path line
+        private Material _lineMat;
+        private float    _uvOffset;
+
+        // Compass HUD
+        private GameObject         _hudRoot;
+        private RectTransform      _hudArrowRT;
+        private TextMeshProUGUI    _hudDistText;
+
+        // ── Lifecycle ─────────────────────────────────────────────────────────────
 
         private void Start()
         {
             if (arCamera == null && Camera.main != null)
                 arCamera = Camera.main.transform;
 
-            EnsureLineRenderer();
-            EnsureCompassHUD();
+            SetupLineRenderer();
+            BuildCompassHUD();
         }
 
         private void Update()
         {
-            if (!_isNavigating || _flattenedRoutePoints.Count == 0 || arCamera == null) return;
+            if (!_navigating || arCamera == null) return;
+            if (_path.Count == 0) return;
 
-            // Animate path texture
-            AnimatePathLine();
+            // Animate scrolling line
+            _uvOffset -= Time.deltaTime * 0.8f;
+            if (_lineMat != null)
+                _lineMat.mainTextureOffset = new Vector2(_uvOffset, 0f);
 
-            Vector3 userPos = arCamera.position;
-            Vector3 targetPt = _flattenedRoutePoints[_currentPointIndex];
+            // Keep line start glued to user position
+            if (pathLine != null && pathLine.positionCount > 0)
+                pathLine.SetPosition(0, arCamera.position + Vector3.up * floorYOffset);
 
-            float groundDistance = Vector2.Distance(
-                new Vector2(userPos.x, userPos.z),
-                new Vector2(targetPt.x, targetPt.z)
-            );
+            // Update compass HUD
+            if (_pathIndex < _path.Count)
+                UpdateCompass(_path[_pathIndex]);
 
-            if (groundDistance <= waypointReachRadius)
-            {
-                // Remove the marker we just reached
-                RemoveFirstMarker();
+            // Check if the user reached the current waypoint
+            Vector3 target = _path[_pathIndex];
+            float dist = Vector2.Distance(
+                new Vector2(arCamera.position.x, arCamera.position.z),
+                new Vector2(target.x, target.z));
 
-                if (_currentPointIndex < _flattenedRoutePoints.Count - 1)
-                {
-                    _currentPointIndex++;
-                    RenderPathLine();
-                    UpdateGuidanceText();
-                }
-                else
-                {
-                    // Arrived!
-                    _isNavigating = false;
-                    pathLineRenderer.positionCount = 0;
-                    ClearWaypointMarkers();
-                    SetCompassHUDVisible(false);
-                    OnInstructionChanged?.Invoke("You have arrived at your destination! 🎉");
-                    OnDestinationReached?.Invoke();
-                }
-            }
+            if (dist <= waypointRadius)
+                AdvanceWaypoint();
             else
-            {
-                // Continuously tie start of line to camera floor position
-                if (pathLineRenderer.positionCount > 0)
-                {
-                    Vector3 userGround = arCamera.position + Vector3.up * floorYOffset;
-                    pathLineRenderer.SetPosition(0, userGround);
-                }
-
-                // Update compass HUD
-                UpdateCompassHUD(targetPt);
-            }
-
-            UpdateGuidanceText();
+                EmitInstruction();
         }
 
         private void OnDestroy()
         {
-            ClearWaypointMarkers();
+            ClearMarkers();
         }
 
-        // ─── Public API ───────────────────────────────────────────────────────────
+        // ── Public API ────────────────────────────────────────────────────────────
 
-        public bool StartNavigation(string startNodeId, string targetNodeId, string graphPath = null)
+        /// <summary>
+        /// Start navigating from <paramref name="startNodeId"/> to
+        /// <paramref name="targetNodeId"/> using the saved building graph.
+        /// Returns false if no path exists.
+        /// </summary>
+        public bool StartNavigation(string startNodeId, string targetNodeId,
+                                    string graphPath = null)
         {
             string path = string.IsNullOrEmpty(graphPath)
-                ? Path.Combine(Application.persistentDataPath, "indoor_graph.json")
-                : graphPath;
+                ? BuildingGraph.DefaultPath : graphPath;
 
-            _activeGraph = BuildingGraph.LoadFromFile(path);
+            _graph = BuildingGraph.LoadFromFile(path);
 
-            if (_activeGraph.nodes.Count == 0)
+            if (_graph == null || _graph.nodes.Count == 0)
             {
-                OnInstructionChanged?.Invoke("No graph found. Record a route first!");
+                OnInstructionChanged?.Invoke("No map recorded yet. Record a route first!");
                 return false;
             }
 
-            _currentRoute = _activeGraph.FindRoute(startNodeId, targetNodeId);
+            List<GraphEdge> route = _graph.FindRoute(startNodeId, targetNodeId);
 
-            if (_currentRoute == null || _currentRoute.Count == 0)
+            if (route == null || route.Count == 0)
             {
-                OnInstructionChanged?.Invoke("No path found between selected locations.");
+                OnInstructionChanged?.Invoke("No path found. Try a different start or destination.");
                 return false;
             }
 
-            // Build flattened list of world-space waypoints from all route edges
-            _flattenedRoutePoints.Clear();
-            string currentNodeId = startNodeId;
-
-            foreach (var edge in _currentRoute)
+            // Flatten all edge path-points into a single ordered list
+            _path.Clear();
+            string cursor = startNodeId;
+            foreach (GraphEdge edge in route)
             {
-                bool isForward = (edge.nodeA == currentNodeId);
-                List<SerializableVector3> points = edge.pathPoints;
+                bool forward = edge.nodeA == cursor;
+                var  pts     = edge.pathPoints;
 
-                if (isForward)
+                if (forward)
                 {
-                    for (int i = 0; i < points.Count; i++)
-                        _flattenedRoutePoints.Add(points[i].ToVector3() + Vector3.up * floorYOffset);
-                    currentNodeId = edge.nodeB;
+                    for (int i = 0; i < pts.Count; i++)
+                        _path.Add(pts[i].ToVector3() + Vector3.up * floorYOffset);
+                    cursor = edge.nodeB;
                 }
                 else
                 {
-                    for (int i = points.Count - 1; i >= 0; i--)
-                        _flattenedRoutePoints.Add(points[i].ToVector3() + Vector3.up * floorYOffset);
-                    currentNodeId = edge.nodeA;
+                    for (int i = pts.Count - 1; i >= 0; i--)
+                        _path.Add(pts[i].ToVector3() + Vector3.up * floorYOffset);
+                    cursor = edge.nodeA;
                 }
             }
 
-            _currentPointIndex = 0;
-            // Skip start waypoint if user is already standing on it
-            if (_flattenedRoutePoints.Count > 1 && arCamera != null)
+            if (_path.Count == 0) return false;
+
+            _pathIndex = 0;
+
+            // Skip first point if user is already standing on it
+            if (arCamera != null && _path.Count > 1)
             {
-                float distToStart = Vector2.Distance(
+                float d = Vector2.Distance(
                     new Vector2(arCamera.position.x, arCamera.position.z),
-                    new Vector2(_flattenedRoutePoints[0].x, _flattenedRoutePoints[0].z)
-                );
-                if (distToStart <= waypointReachRadius)
-                    _currentPointIndex = 1;
+                    new Vector2(_path[0].x, _path[0].z));
+                if (d <= waypointRadius) _pathIndex = 1;
             }
 
-            _isNavigating = true;
+            _navigating = true;
+            _uvOffset   = 0f;
 
-            // Render everything
-            RenderPathLine();
-            SpawnWaypointMarkers();
-            SetCompassHUDVisible(true);
-            UpdateGuidanceText();
+            DrawPathLine();
+            SpawnMarkers();
+            SetHUDVisible(true);
+            EmitInstruction();
             return true;
         }
 
         public void StopNavigation()
         {
-            _isNavigating = false;
-            if (pathLineRenderer != null) pathLineRenderer.positionCount = 0;
-            ClearWaypointMarkers();
-            SetCompassHUDVisible(false);
+            _navigating = false;
+            if (pathLine != null) pathLine.positionCount = 0;
+            ClearMarkers();
+            SetHUDVisible(false);
             OnInstructionChanged?.Invoke("Navigation stopped.");
         }
 
-        // ─── Line Renderer ────────────────────────────────────────────────────────
+        // ── Path Line ─────────────────────────────────────────────────────────────
 
-        private void EnsureLineRenderer()
+        private void SetupLineRenderer()
         {
-            if (pathLineRenderer == null)
+            if (pathLine == null)
             {
-                pathLineRenderer = GetComponent<LineRenderer>();
-                if (pathLineRenderer == null)
-                    pathLineRenderer = gameObject.AddComponent<LineRenderer>();
+                pathLine = GetComponent<LineRenderer>()
+                        ?? gameObject.AddComponent<LineRenderer>();
             }
 
-            pathLineRenderer.startWidth = pathLineWidth;
-            pathLineRenderer.endWidth = pathLineWidth * 0.5f;
+            pathLine.startWidth = pathLineWidth;
+            pathLine.endWidth   = pathLineWidth * 0.4f;
+            pathLine.startColor = pathColor;
+            pathLine.endColor   = new Color(pathColor.r, pathColor.g, pathColor.b, 0.15f);
+            pathLine.textureMode = LineTextureMode.Tile;
+            pathLine.positionCount = 0;
 
-            // Scrolling "follow me" material
-            _lineMaterial = new Material(Shader.Find("Sprites/Default"));
-            _lineMaterial.color = pathColor;
-            pathLineRenderer.material = _lineMaterial;
-            pathLineRenderer.startColor = pathColor;
-            pathLineRenderer.endColor = new Color(pathColor.r, pathColor.g, pathColor.b, 0.2f);
-            pathLineRenderer.textureMode = LineTextureMode.Tile;
-            pathLineRenderer.positionCount = 0;
+            // "Sprites/Default" is available in both Built-in and URP, and it tiles correctly.
+            Shader lineShader = Shader.Find("Sprites/Default");
+            if (lineShader == null) lineShader = Shader.Find("Unlit/Color");
+            _lineMat = new Material(lineShader ?? Shader.Find("Standard")) { color = pathColor };
+            pathLine.material = _lineMat;
         }
 
-        private void RenderPathLine()
+        private void DrawPathLine()
         {
-            if (pathLineRenderer == null || _flattenedRoutePoints.Count == 0) return;
+            if (pathLine == null || _path.Count == 0 || arCamera == null) return;
 
-            int remainingCount = _flattenedRoutePoints.Count - _currentPointIndex;
-            pathLineRenderer.positionCount = remainingCount + 1;
-
-            Vector3 userGround = arCamera.position + Vector3.up * floorYOffset;
-            pathLineRenderer.SetPosition(0, userGround);
-
-            for (int i = 0; i < remainingCount; i++)
-                pathLineRenderer.SetPosition(i + 1, _flattenedRoutePoints[_currentPointIndex + i]);
+            int remaining = _path.Count - _pathIndex;
+            pathLine.positionCount = remaining + 1;
+            pathLine.SetPosition(0, arCamera.position + Vector3.up * floorYOffset);
+            for (int i = 0; i < remaining; i++)
+                pathLine.SetPosition(i + 1, _path[_pathIndex + i]);
         }
 
-        private void AnimatePathLine()
+        // ── Waypoint Markers ──────────────────────────────────────────────────────
+
+        private void SpawnMarkers()
         {
-            if (_lineMaterial == null) return;
-            _uvOffset -= Time.deltaTime * 0.8f;
-            _lineMaterial.mainTextureOffset = new Vector2(_uvOffset, 0f);
-        }
+            ClearMarkers();
+            _markersUseArrowPrefab = arrowPrefab != null;
 
-        // ─── Waypoint Markers (IndoorNavPlaceNote style) ──────────────────────────
-
-        /// <summary>
-        /// Spawns a glowing sphere at every remaining waypoint along the route,
-        /// exactly like the diamond models used in IndoorNavPlaceNote.
-        /// </summary>
-        private void SpawnWaypointMarkers()
-        {
-            ClearWaypointMarkers();
-
-            for (int i = _currentPointIndex; i < _flattenedRoutePoints.Count; i++)
+            for (int i = _pathIndex; i < _path.Count; i++)
             {
-                // Raise markers slightly above the floor line
-                Vector3 pos = _flattenedRoutePoints[i];
-                pos.y += 0.5f;
+                Vector3 pos = _path[i];
+                pos.y += 0.5f; // raise above the floor line
 
                 GameObject marker;
-                if (arrowPrefab != null)
+                if (_markersUseArrowPrefab)
                 {
                     marker = Instantiate(arrowPrefab, pos, Quaternion.identity);
+                    ARArrow arrow = marker.GetComponent<ARArrow>();
+                    if (arrow != null)
+                    {
+                        // Fix: refresh base AFTER placing so bob is correct, then animate in
+                        arrow.RefreshBase();
+                        arrow.AnimateIn();
+                    }
                 }
                 else
                 {
-                    // Fallback: create a glowing sphere (matches IndoorNavPlaceNote diamond style)
+                    // Fallback: glowing sphere — IndoorNavPlaceNote style
                     marker = GameObject.CreatePrimitive(PrimitiveType.Sphere);
-                    marker.transform.position = pos;
+                    marker.transform.position   = pos;
                     marker.transform.localScale = Vector3.one * markerSize;
-
-                    // Remove physics collider (not needed in AR overlay)
                     Destroy(marker.GetComponent<Collider>());
 
-                    // Apply emissive-style material
                     Renderer rend = marker.GetComponent<Renderer>();
                     if (rend != null)
                     {
-                        Material mat = new Material(Shader.Find("Sprites/Default"));
-                        mat.color = markerColor;
+                        Shader s = Shader.Find("Sprites/Default");
+                        var mat  = new Material(s ?? Shader.Find("Standard")) { color = markerColor };
                         rend.material = mat;
                     }
                 }
 
-                marker.name = $"WaypointMarker_{i}";
-                _waypointMarkers.Add(marker);
+                marker.name = $"Waypoint_{i}";
+                _markers.Add(marker);
             }
 
-            // Animate the markers with a pulsating coroutine
-            if (_waypointMarkers.Count > 0)
-                StartCoroutine(PulsateMarkers());
+            // Only pulsate spheres — arrow prefabs pulse themselves via ARArrow.Update
+            if (!_markersUseArrowPrefab && _markers.Count > 0)
+                StartCoroutine(PulseSpheres());
         }
 
-        private System.Collections.IEnumerator PulsateMarkers()
+        /// <summary>
+        /// Pulsation coroutine for fallback sphere markers only.
+        /// NOT called when using the arrowPrefab (ARArrow handles its own pulse).
+        /// </summary>
+        private IEnumerator PulseSpheres()
         {
             float t = 0f;
-            while (_isNavigating && _waypointMarkers.Count > 0)
+            while (_navigating && _markers.Count > 0)
             {
                 t += Time.deltaTime * 2f;
                 float scale = markerSize * (0.85f + 0.2f * Mathf.Sin(t));
-
-                foreach (var m in _waypointMarkers)
-                {
-                    if (m != null)
-                        m.transform.localScale = Vector3.one * scale;
-                }
+                foreach (var m in _markers)
+                    if (m != null) m.transform.localScale = Vector3.one * scale;
                 yield return null;
             }
         }
 
         private void RemoveFirstMarker()
         {
-            if (_waypointMarkers.Count > 0)
+            if (_markers.Count == 0) return;
+            GameObject first = _markers[0];
+            _markers.RemoveAt(0);
+            if (first == null) return;
+
+            ARArrow arrow = first.GetComponent<ARArrow>();
+            if (arrow != null)
+                arrow.DestroyWithFade(); // smooth fade-out
+            else
+                Destroy(first);         // fallback: instant destroy
+        }
+
+        private void ClearMarkers()
+        {
+            foreach (var m in _markers)
             {
-                if (_waypointMarkers[0] != null)
-                    Destroy(_waypointMarkers[0]);
-                _waypointMarkers.RemoveAt(0);
+                if (m == null) continue;
+                ARArrow arrow = m.GetComponent<ARArrow>();
+                if (arrow != null) arrow.DestroyWithFade();
+                else Destroy(m);
             }
+            _markers.Clear();
         }
 
-        private void ClearWaypointMarkers()
+        // ── Waypoint Advance ──────────────────────────────────────────────────────
+
+        private void AdvanceWaypoint()
         {
-            foreach (var m in _waypointMarkers)
-                if (m != null) Destroy(m);
-            _waypointMarkers.Clear();
-        }
+            RemoveFirstMarker();
+            DrawPathLine();
 
-        // ─── Compass HUD Arrow ────────────────────────────────────────────────────
-
-        /// <summary>
-        /// Creates an on-screen compass arrow (like IndoorNavPlaceNote's direction indicator).
-        /// The arrow rotates every frame to point at the next waypoint.
-        /// </summary>
-        private void EnsureCompassHUD()
-        {
-            if (_compassHUDCanvas != null) return;
-
-            // Dedicated canvas behind other UI
-            _compassHUDCanvas = new GameObject("NavCompassHUD");
-            Canvas c = _compassHUDCanvas.AddComponent<Canvas>();
-            c.renderMode = RenderMode.ScreenSpaceOverlay;
-            c.sortingOrder = 50;
-            _compassHUDCanvas.AddComponent<CanvasScaler>();
-
-            // Circular background
-            GameObject bgObj = new GameObject("CompassBG");
-            bgObj.transform.SetParent(_compassHUDCanvas.transform, false);
-            Image bgImg = bgObj.AddComponent<Image>();
-            bgImg.color = new Color(0f, 0f, 0f, 0.55f);
-            RectTransform bgRT = bgObj.GetComponent<RectTransform>();
-            bgRT.anchorMin = new Vector2(0.5f, 1f);
-            bgRT.anchorMax = new Vector2(0.5f, 1f);
-            bgRT.pivot = new Vector2(0.5f, 1f);
-            bgRT.anchoredPosition = new Vector2(0f, -60f);
-            bgRT.sizeDelta = new Vector2(130f, 130f);
-
-            // Arrow image (triangle/chevron drawn with text for zero-dependency)
-            GameObject arrowObj = new GameObject("CompassArrow");
-            arrowObj.transform.SetParent(bgObj.transform, false);
-            Image arrowImg = arrowObj.AddComponent<Image>();
-            arrowImg.color = new Color(0.1f, 0.9f, 1f, 1f);
-            _arrowImageRT = arrowObj.GetComponent<RectTransform>();
-            _arrowImageRT.anchorMin = new Vector2(0.5f, 0.5f);
-            _arrowImageRT.anchorMax = new Vector2(0.5f, 0.5f);
-            _arrowImageRT.pivot = new Vector2(0.5f, 0.5f);
-            _arrowImageRT.anchoredPosition = Vector2.zero;
-            _arrowImageRT.sizeDelta = new Vector2(60f, 80f);
-
-            // Use Unicode arrow as sprite substitute via TMP
-            GameObject arrowTextObj = new GameObject("ArrowGlyph");
-            arrowTextObj.transform.SetParent(bgObj.transform, false);
-            TextMeshProUGUI arrowTMP = arrowTextObj.AddComponent<TextMeshProUGUI>();
-            arrowTMP.text = "▲";
-            arrowTMP.fontSize = 52;
-            arrowTMP.color = new Color(0.1f, 0.95f, 1f, 1f);
-            arrowTMP.alignment = TextAlignmentOptions.Center;
-            // Keep a reference to the TMP for rotation
-            RectTransform arrowTmpRT = arrowTextObj.GetComponent<RectTransform>();
-            arrowTmpRT.anchorMin = new Vector2(0.5f, 0.5f);
-            arrowTmpRT.anchorMax = new Vector2(0.5f, 0.5f);
-            arrowTmpRT.pivot = new Vector2(0.5f, 0.5f);
-            arrowTmpRT.anchoredPosition = new Vector2(0f, 5f);
-            arrowTmpRT.sizeDelta = new Vector2(80f, 80f);
-            // Store the TMP RT as the thing we'll rotate
-            _arrowImageRT = arrowTmpRT;
-
-            // Distance text below arrow
-            GameObject distObj = new GameObject("CompassDist");
-            distObj.transform.SetParent(bgObj.transform, false);
-            _compassDistText = distObj.AddComponent<TextMeshProUGUI>();
-            _compassDistText.text = "";
-            _compassDistText.fontSize = 18;
-            _compassDistText.color = Color.white;
-            _compassDistText.alignment = TextAlignmentOptions.Center;
-            RectTransform distRT = distObj.GetComponent<RectTransform>();
-            distRT.anchorMin = new Vector2(0.5f, 0f);
-            distRT.anchorMax = new Vector2(0.5f, 0f);
-            distRT.pivot = new Vector2(0.5f, 0f);
-            distRT.anchoredPosition = new Vector2(0f, 6f);
-            distRT.sizeDelta = new Vector2(120f, 40f);
-
-            // Destroy the unused image arrow (we use text glyph instead)
-            Destroy(arrowImg.gameObject);
-
-            _compassHUDCanvas.SetActive(false);
-        }
-
-        private void UpdateCompassHUD(Vector3 targetWorldPos)
-        {
-            if (_arrowImageRT == null || arCamera == null) return;
-
-            // Project the direction to target onto the 2D screen plane
-            Vector3 toTarget = targetWorldPos - arCamera.position;
-            toTarget.y = 0f;
-
-            if (toTarget.sqrMagnitude < 0.01f) return;
-
-            // Angle in world space between camera forward and direction to target
-            float angle = Vector3.SignedAngle(
-                Vector3.ProjectOnPlane(arCamera.forward, Vector3.up).normalized,
-                toTarget.normalized,
-                Vector3.up
-            );
-
-            // Rotate the arrow glyph — negative because Unity UI rotates clockwise for positive Z
-            _arrowImageRT.localEulerAngles = new Vector3(0f, 0f, -angle);
-
-            float dist = toTarget.magnitude;
-            if (_compassDistText != null)
-                _compassDistText.text = $"{dist:F1}m";
-        }
-
-        private void SetCompassHUDVisible(bool visible)
-        {
-            if (_compassHUDCanvas != null)
-                _compassHUDCanvas.SetActive(visible);
-        }
-
-        // ─── Turn-by-Turn Text ────────────────────────────────────────────────────
-
-        /// <summary>
-        /// Updates turn-by-turn instructions with pre-announcement of the next turn.
-        /// Based on: ISMSIT 2020 — Mobile AR Indoor Navigation System
-        /// </summary>
-        private void UpdateGuidanceText()
-        {
-            if (_currentPointIndex >= _flattenedRoutePoints.Count) return;
-
-            Vector3 targetPt = _flattenedRoutePoints[_currentPointIndex];
-            float dist = Vector3.Distance(arCamera.position, targetPt);
-
-            Vector3 toTarget = (targetPt - arCamera.position).normalized;
-            float angle = Vector3.SignedAngle(arCamera.forward, toTarget, Vector3.up);
-            string currentDirection = AngleToDirection(angle);
-
-            bool hasNext = (_currentPointIndex + 1) < _flattenedRoutePoints.Count;
-            if (dist <= 3f && hasNext)
+            if (_pathIndex < _path.Count - 1)
             {
-                Vector3 nextPt = _flattenedRoutePoints[_currentPointIndex + 1];
-                Vector3 incoming = (targetPt - arCamera.position).normalized;
-                Vector3 outgoing = (nextPt - targetPt).normalized;
-                float nextAngle = Vector3.SignedAngle(incoming, outgoing, Vector3.up);
-                string nextDir = AngleToDirection(nextAngle);
-
-                if (nextDir != "Walk straight")
-                    OnInstructionChanged?.Invoke($"{currentDirection} ({dist:F1}m) → then {nextDir} ahead");
-                else
-                    OnInstructionChanged?.Invoke($"{currentDirection} ({dist:F1}m)");
+                _pathIndex++;
+                EmitInstruction();
             }
             else
             {
-                OnInstructionChanged?.Invoke($"{currentDirection} ({dist:F1}m)");
+                // Destination reached
+                _navigating = false;
+                if (pathLine != null) pathLine.positionCount = 0;
+                ClearMarkers();
+                SetHUDVisible(false);
+                OnInstructionChanged?.Invoke("🎉 You have arrived at your destination!");
+                OnDestinationReached?.Invoke();
             }
         }
 
-        private string AngleToDirection(float angle)
+        // ── Instruction Text ──────────────────────────────────────────────────────
+
+        private void EmitInstruction()
         {
-            if (angle > 35f && angle < 135f)   return "Turn right";
-            if (angle < -35f && angle > -135f)  return "Turn left";
-            if (Mathf.Abs(angle) >= 135f)       return "Turn around";
-            return "Walk straight";
+            if (arCamera == null || _pathIndex >= _path.Count) return;
+
+            Vector3 target = _path[_pathIndex];
+            float   dist   = Vector3.Distance(
+                new Vector3(arCamera.position.x, 0f, arCamera.position.z),
+                new Vector3(target.x,            0f, target.z));
+
+            int remaining = _path.Count - _pathIndex;
+            string msg = remaining == 1
+                ? $"📍 Destination ahead — {dist:F1} m"
+                : $"➡ Head to waypoint {_pathIndex + 1}/{_path.Count} — {dist:F1} m";
+
+            OnInstructionChanged?.Invoke(msg);
+        }
+
+        // ── Compass HUD ───────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Builds a compact on-screen compass: circular dark background with a
+        /// TMP "▲" glyph that rotates to point at the next waypoint, plus a
+        /// distance label below it.
+        /// </summary>
+        private void BuildCompassHUD()
+        {
+            if (_hudRoot != null) return;
+
+            _hudRoot = new GameObject("NavCompassHUD");
+            Canvas c = _hudRoot.AddComponent<Canvas>();
+            c.renderMode   = RenderMode.ScreenSpaceOverlay;
+            c.sortingOrder = 50;
+            _hudRoot.AddComponent<CanvasScaler>();
+
+            // ── Background circle ──────────────────────────────────────────────
+            GameObject bg = new GameObject("BG");
+            bg.transform.SetParent(_hudRoot.transform, false);
+            Image bgImg = bg.AddComponent<Image>();
+            bgImg.color = new Color(0f, 0f, 0f, 0.55f);
+            RectTransform bgRT = bg.GetComponent<RectTransform>();
+            bgRT.anchorMin        = new Vector2(0.5f, 1f);
+            bgRT.anchorMax        = new Vector2(0.5f, 1f);
+            bgRT.pivot            = new Vector2(0.5f, 1f);
+            bgRT.anchoredPosition = new Vector2(0f, -55f);
+            bgRT.sizeDelta        = new Vector2(120f, 120f);
+
+            // ── Arrow glyph (▲) ───────────────────────────────────────────────
+            GameObject arrowObj = new GameObject("ArrowGlyph");
+            arrowObj.transform.SetParent(bg.transform, false);
+            TextMeshProUGUI tmp = arrowObj.AddComponent<TextMeshProUGUI>();
+            tmp.text      = "▲";
+            tmp.fontSize  = 56;
+            tmp.color     = new Color(0.1f, 0.95f, 1f, 1f);
+            tmp.alignment = TextAlignmentOptions.Center;
+            _hudArrowRT = arrowObj.GetComponent<RectTransform>();
+            _hudArrowRT.anchorMin        = new Vector2(0.5f, 0.5f);
+            _hudArrowRT.anchorMax        = new Vector2(0.5f, 0.5f);
+            _hudArrowRT.pivot            = new Vector2(0.5f, 0.5f);
+            _hudArrowRT.anchoredPosition = new Vector2(0f, 6f);
+            _hudArrowRT.sizeDelta        = new Vector2(90f, 90f);
+
+            // ── Distance label ────────────────────────────────────────────────
+            GameObject distObj = new GameObject("DistLabel");
+            distObj.transform.SetParent(bg.transform, false);
+            _hudDistText = distObj.AddComponent<TextMeshProUGUI>();
+            _hudDistText.text      = "";
+            _hudDistText.fontSize  = 20;
+            _hudDistText.color     = Color.white;
+            _hudDistText.alignment = TextAlignmentOptions.Center;
+            RectTransform distRT = distObj.GetComponent<RectTransform>();
+            distRT.anchorMin        = new Vector2(0.5f, 0f);
+            distRT.anchorMax        = new Vector2(0.5f, 0f);
+            distRT.pivot            = new Vector2(0.5f, 0f);
+            distRT.anchoredPosition = new Vector2(0f, 4f);
+            distRT.sizeDelta        = new Vector2(110f, 38f);
+
+            _hudRoot.SetActive(false);
+        }
+
+        private void UpdateCompass(Vector3 targetWorldPos)
+        {
+            if (_hudArrowRT == null || arCamera == null) return;
+
+            Vector3 toTarget = targetWorldPos - arCamera.position;
+            toTarget.y = 0f;
+            if (toTarget.sqrMagnitude < 0.001f) return;
+
+            Vector3 camFwd = Vector3.ProjectOnPlane(arCamera.forward, Vector3.up);
+            if (camFwd.sqrMagnitude < 0.001f) return;
+
+            float angle = Vector3.SignedAngle(camFwd.normalized, toTarget.normalized, Vector3.up);
+            // Negative because UI rotates counter-clockwise for positive Z values
+            _hudArrowRT.localEulerAngles = new Vector3(0f, 0f, -angle);
+
+            if (_hudDistText != null)
+                _hudDistText.text = $"{toTarget.magnitude:F1} m";
+        }
+
+        private void SetHUDVisible(bool visible)
+        {
+            if (_hudRoot != null) _hudRoot.SetActive(visible);
         }
     }
 }

@@ -1,0 +1,5 @@
+{
+  "_comment": "Copy this file to SupabaseConfig.json and fill in your project details.",
+  "url": "https://YOUR_PROJECT_ID.supabase.co",
+  "anonKey": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+}

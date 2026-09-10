@@ -72,3 +72,6 @@ crashlytics-build.properties
 
 # Android/CMake build temp files
 .utmp/
+
+# Supabase credentials — never commit the real key
+Assets/Resources/SupabaseConfig.json

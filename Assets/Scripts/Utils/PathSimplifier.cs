@@ -4,77 +4,67 @@ using UnityEngine;
 namespace ARNav.Utils
 {
     /// <summary>
-    /// Ramer-Douglas-Peucker (RDP) algorithm extended for 3D polylines.
-    /// Prunes noise and collinear points while strictly preserving corners and turns.
+    /// Ramer-Douglas-Peucker (RDP) algorithm for 3D polylines.
+    /// Removes collinear / near-collinear points while preserving corners and turns.
+    /// Used by PathRecorder to compress recorded walk data before storing in graph edges.
     /// </summary>
     public static class PathSimplifier
     {
-        public static List<Vector3> Simplify(List<Vector3> pointList, float epsilon = 0.15f)
+        /// <summary>
+        /// Simplify a list of 3D world-space points.
+        /// </summary>
+        /// <param name="points">Input point list (at least 2 points).</param>
+        /// <param name="epsilon">Max allowed perpendicular deviation in metres. Default 0.15 m.</param>
+        public static List<Vector3> Simplify(List<Vector3> points, float epsilon = 0.15f)
         {
-            if (pointList == null || pointList.Count < 3)
-                return pointList != null ? new List<Vector3>(pointList) : new List<Vector3>();
+            if (points == null || points.Count < 3)
+                return points != null ? new List<Vector3>(points) : new List<Vector3>();
 
-            int firstIndex = 0;
-            int lastIndex = pointList.Count - 1;
-            List<int> pointIndicesToKeep = new List<int>();
+            var keepIndices = new List<int> { 0, points.Count - 1 };
+            RDPRecurse(points, 0, points.Count - 1, epsilon, keepIndices);
+            keepIndices.Sort();
 
-            // Always keep start and end
-            pointIndicesToKeep.Add(firstIndex);
-            pointIndicesToKeep.Add(lastIndex);
-
-            RDPStep(pointList, firstIndex, lastIndex, epsilon, ref pointIndicesToKeep);
-
-            pointIndicesToKeep.Sort();
-
-            List<Vector3> returnPoints = new List<Vector3>(pointIndicesToKeep.Count);
-            foreach (int index in pointIndicesToKeep)
-            {
-                returnPoints.Add(pointList[index]);
-            }
-
-            return returnPoints;
+            var result = new List<Vector3>(keepIndices.Count);
+            foreach (int idx in keepIndices)
+                result.Add(points[idx]);
+            return result;
         }
 
-        private static void RDPStep(List<Vector3> points, int first, int last, float epsilon, ref List<int> keepIndices)
-        {
-            float maxDistance = 0f;
-            int maxIndex = 0;
+        // ─── Internals ────────────────────────────────────────────────────────────
 
-            Vector3 p1 = points[first];
-            Vector3 p2 = points[last];
+        private static void RDPRecurse(List<Vector3> pts, int first, int last,
+                                       float epsilon, List<int> keep)
+        {
+            float maxDist  = 0f;
+            int   maxIndex = 0;
 
             for (int i = first + 1; i < last; i++)
             {
-                float dist = PerpendicularDistance3D(points[i], p1, p2);
-                if (dist > maxDistance)
-                {
-                    maxDistance = dist;
-                    maxIndex = i;
-                }
+                float d = PerpendicularDistance(pts[i], pts[first], pts[last]);
+                if (d > maxDist) { maxDist = d; maxIndex = i; }
             }
 
-            if (maxDistance >= epsilon)
+            if (maxDist >= epsilon)
             {
-                keepIndices.Add(maxIndex);
-                RDPStep(points, first, maxIndex, epsilon, ref keepIndices);
-                RDPStep(points, maxIndex, last, epsilon, ref keepIndices);
+                keep.Add(maxIndex);
+                RDPRecurse(pts, first,    maxIndex, epsilon, keep);
+                RDPRecurse(pts, maxIndex, last,     epsilon, keep);
             }
         }
 
-        private static float PerpendicularDistance3D(Vector3 pt, Vector3 lineStart, Vector3 lineEnd)
+        /// <summary>
+        /// Perpendicular distance from point <paramref name="pt"/> to the line
+        /// segment defined by <paramref name="a"/> → <paramref name="b"/>.
+        /// </summary>
+        private static float PerpendicularDistance(Vector3 pt, Vector3 a, Vector3 b)
         {
-            Vector3 line = lineEnd - lineStart;
-            float lineLenSq = line.sqrMagnitude;
+            Vector3 ab = b - a;
+            float   lenSq = ab.sqrMagnitude;
+            if (lenSq < 1e-6f) return Vector3.Distance(pt, a);
 
-            if (lineLenSq < 1e-6f)
-                return Vector3.Distance(pt, lineStart);
-
-            // Project pt onto line segment
-            float t = Vector3.Dot(pt - lineStart, line) / lineLenSq;
-            t = Mathf.Clamp01(t);
-
-            Vector3 projection = lineStart + t * line;
-            return Vector3.Distance(pt, projection);
+            float   t  = Mathf.Clamp01(Vector3.Dot(pt - a, ab) / lenSq);
+            Vector3 proj = a + t * ab;
+            return Vector3.Distance(pt, proj);
         }
     }
 }

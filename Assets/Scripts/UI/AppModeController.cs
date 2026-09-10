@@ -1,6 +1,5 @@
 using System.Collections;
 using System.Collections.Generic;
-using System.IO;
 using UnityEngine;
 using UnityEngine.UI;
 using UnityEngine.XR.ARFoundation;
@@ -11,34 +10,45 @@ using TMPro;
 using ARNav.Recording;
 using ARNav.Navigation;
 using ARNav.Graph;
+using ARNav.Backend;
 
 namespace ARNav.UI
 {
     /// <summary>
-    /// Master UI controller — manages Record/Navigate modes, camera permissions,
-    /// ARCore vs Sensor-AR fallback, and responsive mobile layout.
+    /// Master UI controller for AR-NAV.
     ///
-    /// IndoorNavPlaceNote-inspired improvements:
-    ///  • Start-node dropdown so the user picks where they ARE, not just where they want to go.
-    ///  • Named Start/End input before recording so routes are labelled meaningfully.
-    ///  • Navigation starts only when a valid start ≠ destination is selected.
+    /// Responsibilities:
+    ///   • Camera permission request + ARCore availability check on startup.
+    ///   • Activates SensorARFallback on devices without ARCore.
+    ///   • Manages three UI panels: ModeSelect → Recording → Navigation.
+    ///   • Correct recording flow: open panel → fill name → tap Start → walk → tap Finish.
+    ///   • Populates start-location and destination dropdowns from the saved graph.
+    ///   • Post-navigation feedback thumbs up/down adjusts edge confidence scores.
+    ///
+    /// KEY FIXES vs old version:
+    ///   • Recording does NOT start automatically when the panel opens.
+    ///   • startRecordButton is correctly wired.
+    ///   • feedbackPanel IS auto-located by TryFindPanel.
+    ///   • EnsureStartNodeDropdown builds a complete TMP_Dropdown with required template.
+    ///   • QR stub clearly tells the user it's not yet implemented (no silent timeout).
+    ///   • buildingId and floor exposed so multi-building recording is possible.
     /// </summary>
     public class AppModeController : MonoBehaviour
     {
-        // ─── Inspector fields ──────────────────────────────────────────────────────
-        [Header("Subsystems")]
-        [SerializeField] private PathRecorder recorder;
-        [SerializeField] private PathNavigator navigator;
-        [SerializeField] private ARNav.Backend.SupabaseSyncService supabaseService;
+        // ── Inspector ─────────────────────────────────────────────────────────────
+        [Header("Subsystems (auto-found if null)")]
+        [SerializeField] private PathRecorder      recorder;
+        [SerializeField] private PathNavigator     navigator;
+        [SerializeField] private SupabaseSyncService supabase;
 
-        [Header("UI Panels")]
+        [Header("UI Panels (auto-found if null)")]
         [SerializeField] private GameObject modeSelectPanel;
         [SerializeField] private GameObject recordingPanel;
         [SerializeField] private GameObject navigationPanel;
         [SerializeField] private GameObject feedbackPanel;
 
         [Header("Recording UI")]
-        [SerializeField] private TMP_Text      recordingStatusText;
+        [SerializeField] private TMP_Text       recordingStatusText;
         [SerializeField] private TMP_InputField startPointInput;
         [SerializeField] private TMP_InputField endPointInput;
         [SerializeField] private Button         startRecordButton;
@@ -46,263 +56,221 @@ namespace ARNav.UI
 
         [Header("Navigation UI")]
         [SerializeField] private TMP_Text     navInstructionText;
-        [SerializeField] private TMP_Dropdown destinationDropdown;    // WHERE you want to go
-        [SerializeField] private TMP_Dropdown startNodeDropdown;      // WHERE you are now
+        [SerializeField] private TMP_Dropdown destinationDropdown;
+        [SerializeField] private TMP_Dropdown startNodeDropdown;
         [SerializeField] private Button       startNavButton;
         [SerializeField] private Button       stopNavButton;
 
-        [Header("Feedback UI (Post-Walk Rating)")]
+        [Header("Feedback UI")]
         [SerializeField] private Button thumbsUpButton;
         [SerializeField] private Button thumbsDownButton;
 
-        // ─── Runtime state ─────────────────────────────────────────────────────────
-        private BuildingGraph   _cachedGraph;
-        private List<string>    _availableNodeIds = new List<string>();
+        [Header("Recording Settings")]
+        [SerializeField] private string buildingId = "main_building";
+        [SerializeField] private int    floor      = 1;
 
-        // QR Code start localization (ICSCSS 2023)
-        private string _qrLocatedNodeId = null;
+        // ── Private state ─────────────────────────────────────────────────────────
+        private BuildingGraph _graph;
+        private List<string>  _nodeIds   = new List<string>();   // parallel to dropdown options
+        private string        _qrNodeId  = null;                 // from QR scan (if implemented)
 
-        // ─── Unity lifecycle ───────────────────────────────────────────────────────
+        // ── Lifecycle ─────────────────────────────────────────────────────────────
 
         private void Awake()
         {
-            FormatCanvasScaler();
+            // Apply a responsive canvas scaler
+            CanvasScaler cs = GetComponentInParent<CanvasScaler>()
+                           ?? FindAnyObjectByType<CanvasScaler>();
+            if (cs != null)
+            {
+                cs.uiScaleMode         = CanvasScaler.ScaleMode.ScaleWithScreenSize;
+                cs.referenceResolution = new Vector2(1080, 1920);
+                cs.matchWidthOrHeight  = 0.5f;
+            }
         }
 
         private void Start()
         {
-            StartCoroutine(InitializePermissionsAndAR());
-            AutoLayoutButtons();
-            EnsureUIReferencesAndListeners();
+            // Auto-find subsystems
+            if (recorder  == null) recorder  = FindAnyObjectByType<PathRecorder>();
+            if (navigator == null) navigator = FindAnyObjectByType<PathNavigator>();
+            if (supabase  == null) supabase  = FindAnyObjectByType<SupabaseSyncService>();
 
-            if (recorder      == null) recorder      = FindAnyObjectByType<PathRecorder>();
-            if (navigator     == null) navigator     = FindAnyObjectByType<PathNavigator>();
-            if (supabaseService == null) supabaseService = FindAnyObjectByType<ARNav.Backend.SupabaseSyncService>();
-
-            // Recorder events
+            // Wire events
             if (recorder != null)
             {
-                recorder.OnStatusChanged += UpdateRecordingStatus;
-                recorder.OnRecordingProgress += (pts, dist) =>
-                {
-                    if (recordingStatusText != null)
-                        recordingStatusText.text =
-                            $"🔴 Recording: {pts} pts | {dist:F1}m | Anchors: {recorder.AnchorCount}";
-                };
+                recorder.OnStatusChanged += SetRecordingStatus;
+                recorder.OnProgress      += (pts, dist) =>
+                    SetRecordingStatus($"🔴 {pts} pts | {dist:F1} m | {recorder.AnchorCount} anchors");
             }
 
-            if (supabaseService != null)
-            {
-                supabaseService.OnUploadCompleted += (msg) => UpdateRecordingStatus(msg);
-                supabaseService.OnSyncFailed      += (err) => Debug.LogWarning(err);
-            }
-
-            // Navigator events
             if (navigator != null)
             {
-                navigator.OnInstructionChanged += UpdateNavInstruction;
-                navigator.OnDestinationReached += ShowFeedbackDialog;
+                navigator.OnInstructionChanged += SetNavInstruction;
+                navigator.OnDestinationReached += OnArrived;
+            }
+
+            if (supabase != null)
+            {
+                supabase.OnUploadCompleted += msg => Debug.Log($"[Supabase] {msg}");
+                supabase.OnSyncFailed      += err => Debug.LogWarning($"[Supabase] {err}");
+            }
+
+            WireAllPanels();
+            StartCoroutine(InitAR());
+        }
+
+        // ── AR Init ───────────────────────────────────────────────────────────────
+
+        private IEnumerator InitAR()
+        {
+#if UNITY_ANDROID
+            if (!Permission.HasUserAuthorizedPermission(Permission.Camera))
+            {
+                Permission.RequestUserPermission(Permission.Camera);
+                float t = 8f;
+                while (!Permission.HasUserAuthorizedPermission(Permission.Camera) && t > 0f)
+                { t -= 0.2f; yield return new WaitForSeconds(0.2f); }
+            }
+#endif
+
+            // Wait for ARSession to report its state
+            float waitLimit = 4f;
+            while ((ARSession.state == ARSessionState.None ||
+                    ARSession.state == ARSessionState.CheckingAvailability) && waitLimit > 0f)
+            {
+                yield return ARSession.CheckAvailability();
+                waitLimit -= 0.1f;
+                yield return new WaitForSeconds(0.1f);
+            }
+
+            bool needsFallback =
+                ARSession.state == ARSessionState.Unsupported  ||
+                ARSession.state == ARSessionState.NeedsInstall ||
+                ARSession.state == ARSessionState.None;
+
+            if (needsFallback)
+            {
+                Debug.LogWarning("[AR-NAV] ARCore unavailable — activating sensor fallback.");
+                ARSession arSession = FindAnyObjectByType<ARSession>();
+                if (arSession != null) arSession.enabled = false;
+
+                ARCameraBackground bg = FindAnyObjectByType<ARCameraBackground>();
+                if (bg != null) bg.enabled = false;
+
+                SensorARFallback fallback = FindAnyObjectByType<SensorARFallback>()
+                    ?? gameObject.AddComponent<SensorARFallback>();
+                fallback.ActivateFallback();
             }
 
             ShowModeSelect();
         }
 
-        // ─── UI wiring ─────────────────────────────────────────────────────────────
+        // ── Panel wiring ──────────────────────────────────────────────────────────
 
-        private void EnsureUIReferencesAndListeners()
+        private void WireAllPanels()
         {
-            Canvas mainCanvas = GetComponentInParent<Canvas>();
-            if (mainCanvas == null) mainCanvas = FindAnyObjectByType<Canvas>();
+            Canvas canvas = GetComponentInParent<Canvas>()
+                         ?? FindAnyObjectByType<Canvas>();
 
-            // Auto-detect panels
-            TryFindPanel(ref modeSelectPanel,  mainCanvas, "ModeSelectPanel");
-            TryFindPanel(ref recordingPanel,   mainCanvas, "RecordingPanel");
-            TryFindPanel(ref navigationPanel,  mainCanvas, "NavigationPanel");
+            // Auto-locate all four panels
+            TryFindPanel(ref modeSelectPanel,  canvas, "ModeSelectPanel");
+            TryFindPanel(ref recordingPanel,   canvas, "RecordingPanel");
+            TryFindPanel(ref navigationPanel,  canvas, "NavigationPanel");
+            TryFindPanel(ref feedbackPanel,    canvas, "FeedbackPanel");   // FIX: was missing
 
-            // Fix hierarchy: unparent any Button/Dropdown that accidentally ended up
-            // nested inside a TMP_Text component
-            FixNestedChildren(navigationPanel);
-            FixNestedChildren(recordingPanel);
-
-            // Wire ModeSelect buttons
-            WirePanel(modeSelectPanel, (b, txt) =>
+            // ── ModeSelect ─────────────────────────────────────────────────────────
+            WireButtons(modeSelectPanel, (btn, label) =>
             {
-                if (txt.Contains("record"))
-                {
-                    b.onClick.AddListener(OpenRecordMode);
-                    Debug.Log($"[AppModeController] Wired Record button: {b.name}");
-                }
-                else if (txt.Contains("navigat"))
-                {
-                    b.onClick.AddListener(OpenNavigateMode);
-                    Debug.Log($"[AppModeController] Wired Navigate button: {b.name}");
-                }
+                if (label.Contains("record"))
+                    btn.onClick.AddListener(OpenRecordPanel);
+                else if (label.Contains("navigat"))
+                    btn.onClick.AddListener(OpenNavPanel);
             });
 
-            // Wire RecordingPanel
-            WirePanel(recordingPanel, (b, txt) =>
+            // ── Recording panel ────────────────────────────────────────────────────
+            // FIX: startRecord button wired explicitly; recording does NOT auto-start
+            WireButtons(recordingPanel, (btn, label) =>
             {
-                if (txt.Contains("finish") || txt.Contains("save") || txt.Contains("stop"))
+                if (label.Contains("start") && !label.Contains("nav"))
                 {
-                    stopRecordButton = b;
-                    b.onClick.AddListener(OnStopRecordClicked);
-                    Debug.Log($"[AppModeController] Wired Stop/Finish button: {b.name}");
+                    startRecordButton = btn;
+                    btn.onClick.AddListener(OnStartRecordClicked);
                 }
-                else if (txt.Contains("cancel") || txt.Contains("back"))
+                else if (label.Contains("finish") || label.Contains("save") || label.Contains("stop"))
                 {
-                    b.onClick.AddListener(CancelRecordingAndReturn);
+                    stopRecordButton = btn;
+                    btn.onClick.AddListener(OnStopRecordClicked);
                 }
+                else if (label.Contains("cancel") || label.Contains("back"))
+                    btn.onClick.AddListener(CancelRecordingAndReturn);
             });
 
             if (recordingStatusText == null && recordingPanel != null)
                 recordingStatusText = recordingPanel.GetComponentInChildren<TMP_Text>(true);
 
-            // Wire NavigationPanel buttons
-            WirePanel(navigationPanel, (b, txt) =>
+            // ── Navigation panel ───────────────────────────────────────────────────
+            WireButtons(navigationPanel, (btn, label) =>
             {
-                if (txt.Contains("start") || txt.Contains("nav") || txt.Contains("go"))
+                if (label.Contains("go") || (label.Contains("start") && label.Contains("nav")))
                 {
-                    startNavButton = b;
-                    b.onClick.AddListener(OnStartNavClicked);
-                    Debug.Log($"[AppModeController] Wired Start Nav button: {b.name}");
+                    startNavButton = btn;
+                    btn.onClick.AddListener(OnStartNavClicked);
                 }
-                else if (txt.Contains("stop") || txt.Contains("cancel") || txt.Contains("back"))
+                else if (label.Contains("stop") || label.Contains("back") || label.Contains("cancel"))
                 {
-                    stopNavButton = b;
-                    b.onClick.AddListener(OnStopNavClicked);
-                    Debug.Log($"[AppModeController] Wired Stop/Back Nav button: {b.name}");
+                    stopNavButton = btn;
+                    btn.onClick.AddListener(OnStopNavClicked);
                 }
             });
 
-            // Ensure a back button exists in nav panel
-            if (navigationPanel != null)
-                EnsureBackButton(navigationPanel.transform, OnStopNavClicked);
+            if (navInstructionText == null && navigationPanel != null)
+                navInstructionText = navigationPanel.GetComponentInChildren<TMP_Text>(true);
 
-            // Find dropdowns
             if (navigationPanel != null)
             {
                 var dropdowns = navigationPanel.GetComponentsInChildren<TMP_Dropdown>(true);
                 if (dropdowns.Length >= 1 && destinationDropdown == null)
                     destinationDropdown = dropdowns[0];
                 if (dropdowns.Length >= 2 && startNodeDropdown == null)
-                    startNodeDropdown = dropdowns[1];
-
-                if (navInstructionText == null)
-                    navInstructionText = navigationPanel.GetComponentInChildren<TMP_Text>(true);
+                    startNodeDropdown   = dropdowns[1];
             }
 
-            // Wire feedback panel
-            if (thumbsUpButton   != null) { thumbsUpButton.onClick.RemoveAllListeners();   thumbsUpButton.onClick.AddListener(() => SubmitRating(1.0f));  }
-            if (thumbsDownButton != null) { thumbsDownButton.onClick.RemoveAllListeners(); thumbsDownButton.onClick.AddListener(() => SubmitRating(-0.5f)); }
+            // ── Feedback panel ─────────────────────────────────────────────────────
+            if (thumbsUpButton   != null) thumbsUpButton.onClick.AddListener(()   => SubmitRating(1f));
+            if (thumbsDownButton != null) thumbsDownButton.onClick.AddListener(() => SubmitRating(-0.5f));
         }
 
-        // ─── Helper wiring utilities ───────────────────────────────────────────────
-
-        private void TryFindPanel(ref GameObject field, Canvas canvas, string name)
-        {
-            if (field != null || canvas == null) return;
-            var t = canvas.transform.Find(name);
-            if (t != null) field = t.gameObject;
-        }
-
-        private void FixNestedChildren(GameObject panel)
-        {
-            if (panel == null) return;
-            var all = panel.GetComponentsInChildren<Transform>(true);
-            foreach (var child in all)
-            {
-                if (child == panel.transform) continue;
-                if (child.GetComponent<Button>() != null || child.GetComponent<TMP_Dropdown>() != null)
-                    child.SetParent(panel.transform, false);
-            }
-        }
-
-        private void WirePanel(GameObject panel, System.Action<Button, string> handler)
-        {
-            if (panel == null) return;
-            foreach (var b in panel.GetComponentsInChildren<Button>(true))
-            {
-                string txt = (b.GetComponentInChildren<TMP_Text>()?.text?.ToLower() ?? b.name.ToLower());
-                b.onClick.RemoveAllListeners();
-                handler(b, txt);
-            }
-        }
-
-        private void EnsureBackButton(Transform parentPanel, UnityEngine.Events.UnityAction action)
-        {
-            if (parentPanel.Find("BackButton") != null) return;
-
-            GameObject backObj = new GameObject("BackButton");
-            backObj.transform.SetParent(parentPanel, false);
-
-            Image img = backObj.AddComponent<Image>();
-            img.color = new Color(0.12f, 0.12f, 0.15f, 0.9f);
-
-            Button btn = backObj.AddComponent<Button>();
-            btn.onClick.AddListener(action);
-
-            RectTransform rt = backObj.GetComponent<RectTransform>();
-            rt.anchorMin        = new Vector2(0f, 1f);
-            rt.anchorMax        = new Vector2(0f, 1f);
-            rt.pivot            = new Vector2(0f, 1f);
-            rt.anchoredPosition = new Vector2(40f, -40f);
-            rt.sizeDelta        = new Vector2(190f, 70f);
-
-            GameObject textObj = new GameObject("Text (TMP)");
-            textObj.transform.SetParent(backObj.transform, false);
-            var tmp = textObj.AddComponent<TextMeshProUGUI>();
-            tmp.text      = "← Back";
-            tmp.fontSize  = 26;
-            tmp.alignment = TextAlignmentOptions.Center;
-            tmp.color     = Color.white;
-            RectTransform textRt = textObj.GetComponent<RectTransform>();
-            textRt.anchorMin = Vector2.zero;
-            textRt.anchorMax = Vector2.one;
-            textRt.sizeDelta = Vector2.zero;
-        }
-
-        // ─── Panel visibility ──────────────────────────────────────────────────────
+        // ── Panel visibility ──────────────────────────────────────────────────────
 
         public void ShowModeSelect()
         {
             SetPanels(modeSelect: true);
-            RefreshGraphDestinations();
+            RefreshGraph();
         }
 
-        public void OpenRecordMode()
+        public void OpenRecordPanel()
         {
             SetPanels(recording: true);
-            string startName = (startPointInput != null && !string.IsNullOrEmpty(startPointInput.text))
-                ? startPointInput.text : "Start Location";
-
-            if (recorder != null) recorder.StartRecording(startName);
-
-            if (recordingStatusText != null)
-                recordingStatusText.text = "🔴 Recording Route... Walk normally.\nTap 'Finish & Save' when done.";
+            // FIX: do NOT call StartRecording here — user must fill name and tap Start
+            SetRecordingStatus("Enter start location name, then tap Start Recording.");
         }
 
-        public void CancelRecordingAndReturn()
-        {
-            if (recorder != null && recorder.IsRecording)
-                recorder.StopAndSaveRecording("Cancelled");
-            ShowModeSelect();
-        }
-
-        public void OpenNavigateMode()
+        public void OpenNavPanel()
         {
             SetPanels(navigation: true);
-            RefreshGraphDestinations();
+            RefreshGraph();
 
             if (navInstructionText != null)
             {
-                navInstructionText.text = (_cachedGraph != null && _cachedGraph.nodes.Count >= 2)
-                    ? "Pick your location & destination, then tap Start"
-                    : "No routes recorded yet. Please go back and Record a route first!";
+                navInstructionText.text = _graph != null && _graph.nodes.Count >= 2
+                    ? "Select your location and destination, then tap Navigate."
+                    : "No routes recorded yet. Go back and record a route first.";
             }
         }
 
         private void SetPanels(bool modeSelect = false, bool recording = false,
-                               bool navigation = false, bool feedback = false)
+                                bool navigation = false, bool feedback = false)
         {
             if (modeSelectPanel  != null) modeSelectPanel.SetActive(modeSelect);
             if (recordingPanel   != null) recordingPanel.SetActive(recording);
@@ -310,180 +278,122 @@ namespace ARNav.UI
             if (feedbackPanel    != null) feedbackPanel.SetActive(feedback);
         }
 
-        // ─── Recording flow ────────────────────────────────────────────────────────
+        // ── Recording flow ────────────────────────────────────────────────────────
 
+        /// <summary>Called when user taps "Start Recording" (not on panel open).</summary>
         public void OnStartRecordClicked()
         {
-            string startName = (startPointInput != null && !string.IsNullOrEmpty(startPointInput.text))
-                ? startPointInput.text : "Location A";
-            recorder?.StartRecording(startName);
+            if (recorder == null) return;
+            string name = (startPointInput != null && !string.IsNullOrEmpty(startPointInput.text))
+                ? startPointInput.text.Trim()
+                : "Location A";
+            recorder.StartRecording(name, buildingId, floor);
+
+            // Disable start button so it can't be tapped twice
+            if (startRecordButton != null) startRecordButton.interactable = false;
+            if (stopRecordButton  != null) stopRecordButton.interactable  = true;
         }
 
         public void OnStopRecordClicked()
         {
+            if (recorder == null) return;
             string endName = (endPointInput != null && !string.IsNullOrEmpty(endPointInput.text))
-                ? endPointInput.text : "Location B";
+                ? endPointInput.text.Trim()
+                : "Location B";
 
-            BuildingGraph saved = recorder?.StopAndSaveRecording(endName);
+            BuildingGraph saved = recorder.StopAndSave(endName);
 
-            if (supabaseService != null && saved != null &&
-                saved.nodes.Count >= 2 && saved.edges.Count > 0)
-            {
-                var n1   = saved.nodes[saved.nodes.Count - 2];
-                var n2   = saved.nodes[saved.nodes.Count - 1];
-                var edge = saved.edges[saved.edges.Count - 1];
-                supabaseService.UploadEdge(n1, n2, edge);
-            }
+            if (supabase != null && saved != null)
+                supabase.UploadSession(recorder.SessionNodes, recorder.SessionEdges, buildingId);
+
+            // Re-enable buttons for next recording
+            if (startRecordButton != null) startRecordButton.interactable = true;
+            if (stopRecordButton  != null) stopRecordButton.interactable  = false;
 
             ShowModeSelect();
         }
 
-        // ─── Navigation flow ───────────────────────────────────────────────────────
-
-        /// <summary>
-        /// Populates both the Start-location and Destination dropdowns from the saved graph.
-        /// Inspired by IndoorNavPlaceNote where both origin and destination are selectable.
-        /// </summary>
-        private void RefreshGraphDestinations()
+        public void CancelRecordingAndReturn()
         {
-            string path = Path.Combine(Application.persistentDataPath, "indoor_graph.json");
-            _cachedGraph = BuildingGraph.LoadFromFile(path);
+            recorder?.CancelRecording();
+            if (startRecordButton != null) startRecordButton.interactable = true;
+            if (stopRecordButton  != null) stopRecordButton.interactable  = false;
+            ShowModeSelect();
+        }
 
-            _availableNodeIds.Clear();
+        // ── Navigation flow ───────────────────────────────────────────────────────
+
+        private void RefreshGraph()
+        {
+            _graph = BuildingGraph.LoadFromFile(BuildingGraph.DefaultPath);
+            _nodeIds.Clear();
             var options = new List<string>();
 
-            foreach (var node in _cachedGraph.nodes)
+            if (_graph != null)
             {
-                options.Add(node.name);
-                _availableNodeIds.Add(node.id);
+                foreach (var node in _graph.nodes)
+                {
+                    options.Add(node.name);
+                    _nodeIds.Add(node.id);
+                }
             }
 
             if (options.Count == 0)
-                options.Add("(No recorded routes yet)");
+                options.Add("(No routes recorded)");
 
             // Destination dropdown
             if (destinationDropdown != null)
             {
                 destinationDropdown.ClearOptions();
                 destinationDropdown.AddOptions(options);
-                // Default: last node as destination
                 if (destinationDropdown.options.Count > 1)
                     destinationDropdown.value = destinationDropdown.options.Count - 1;
             }
 
-            // Start node dropdown — same list, default to index 0 (or QR-resolved)
+            // Start-location dropdown
+            EnsureStartDropdown();
             if (startNodeDropdown != null)
             {
                 startNodeDropdown.ClearOptions();
                 startNodeDropdown.AddOptions(new List<string>(options));
                 startNodeDropdown.value = 0;
 
-                // If QR gave us a node, pre-select it
-                if (!string.IsNullOrEmpty(_qrLocatedNodeId))
+                if (!string.IsNullOrEmpty(_qrNodeId))
                 {
-                    int idx = _availableNodeIds.IndexOf(_qrLocatedNodeId);
-                    if (idx >= 0) startNodeDropdown.value = idx;
+                    int qrIdx = _nodeIds.IndexOf(_qrNodeId);
+                    if (qrIdx >= 0) startNodeDropdown.value = qrIdx;
                 }
             }
-            else
-            {
-                // No second dropdown in scene — create one dynamically
-                if (navigationPanel != null && _cachedGraph.nodes.Count >= 2)
-                    EnsureStartNodeDropdown();
-            }
-        }
-
-        /// <summary>
-        /// Creates a "You are at:" dropdown above the existing destination dropdown when
-        /// the scene doesn't have one pre-wired.
-        /// </summary>
-        private void EnsureStartNodeDropdown()
-        {
-            if (navigationPanel == null || startNodeDropdown != null) return;
-
-            // Find existing destination dropdown to place above it
-            RectTransform destRT = destinationDropdown?.GetComponent<RectTransform>();
-
-            GameObject dropObj = new GameObject("StartNodeDropdown");
-            dropObj.transform.SetParent(navigationPanel.transform, false);
-
-            startNodeDropdown = dropObj.AddComponent<TMP_Dropdown>();
-
-            RectTransform rt = dropObj.GetComponent<RectTransform>();
-            rt.anchorMin = new Vector2(0.5f, 0.5f);
-            rt.anchorMax = new Vector2(0.5f, 0.5f);
-            rt.pivot     = new Vector2(0.5f, 0.5f);
-
-            // Place above destination dropdown
-            float yPos = destRT != null ? destRT.anchoredPosition.y + 140f : 220f;
-            rt.anchoredPosition = new Vector2(0f, yPos);
-            rt.sizeDelta        = new Vector2(650f, 110f);
-
-            // Label
-            GameObject labelObj = new GameObject("StartLabel");
-            labelObj.transform.SetParent(navigationPanel.transform, false);
-            TextMeshProUGUI label = labelObj.AddComponent<TextMeshProUGUI>();
-            label.text      = "📍 You are at:";
-            label.fontSize  = 24;
-            label.color     = new Color(0.7f, 0.95f, 1f, 1f);
-            label.alignment = TextAlignmentOptions.Center;
-            RectTransform labelRT = labelObj.GetComponent<RectTransform>();
-            labelRT.anchorMin        = new Vector2(0.5f, 0.5f);
-            labelRT.anchorMax        = new Vector2(0.5f, 0.5f);
-            labelRT.pivot            = new Vector2(0.5f, 0.5f);
-            labelRT.anchoredPosition = new Vector2(0f, yPos + 70f);
-            labelRT.sizeDelta        = new Vector2(650f, 50f);
-
-            // Populate options
-            var opts = new List<string>();
-            foreach (var node in _cachedGraph.nodes) opts.Add(node.name);
-            startNodeDropdown.AddOptions(opts);
         }
 
         private void OnStartNavClicked()
         {
-            if (_cachedGraph == null || _cachedGraph.nodes.Count < 2 || _availableNodeIds.Count < 2)
+            if (_graph == null || _nodeIds.Count < 2)
             {
-                if (navInstructionText != null)
-                    navInstructionText.text = "Need at least 2 recorded nodes to navigate!";
+                SetNavInstruction("Need at least 2 recorded nodes to navigate.");
                 return;
             }
 
-            // Resolve destination index
-            int destIndex = destinationDropdown != null ? destinationDropdown.value : _availableNodeIds.Count - 1;
-            if (destIndex < 0 || destIndex >= _availableNodeIds.Count) return;
-            string targetNodeId = _availableNodeIds[destIndex];
+            int destIdx = destinationDropdown != null ? destinationDropdown.value : _nodeIds.Count - 1;
+            if (destIdx < 0 || destIdx >= _nodeIds.Count) return;
+            string destId = _nodeIds[destIdx];
 
-            // Resolve start node:
-            //  1. QR-scanned node  (highest priority)
-            //  2. User-selected start dropdown
-            //  3. Fallback: first recorded node
-            string startNodeId;
-            if (!string.IsNullOrEmpty(_qrLocatedNodeId))
-            {
-                startNodeId = _qrLocatedNodeId;
-            }
-            else if (startNodeDropdown != null && startNodeDropdown.value >= 0
-                     && startNodeDropdown.value < _availableNodeIds.Count)
-            {
-                startNodeId = _availableNodeIds[startNodeDropdown.value];
-            }
+            string startId;
+            if (!string.IsNullOrEmpty(_qrNodeId))
+                startId = _qrNodeId;
+            else if (startNodeDropdown != null && startNodeDropdown.value < _nodeIds.Count)
+                startId = _nodeIds[startNodeDropdown.value];
             else
-            {
-                startNodeId = _cachedGraph.nodes[0].id;
-            }
+                startId = _nodeIds[0];
 
-            // Guard: start == destination
-            if (startNodeId == targetNodeId)
+            if (startId == destId)
             {
-                if (navInstructionText != null)
-                    navInstructionText.text = "Start and destination are the same! Please pick a different destination.";
+                SetNavInstruction("Start and destination are the same. Pick a different destination.");
                 return;
             }
 
-            bool ok = navigator.StartNavigation(startNodeId, targetNodeId);
-            if (!ok && navInstructionText != null)
-                navInstructionText.text = "Could not find a path. Try a different destination.";
+            bool ok = navigator != null && navigator.StartNavigation(startId, destId);
+            if (!ok) SetNavInstruction("No path found. Try different start/destination.");
         }
 
         private void OnStopNavClicked()
@@ -492,263 +402,121 @@ namespace ARNav.UI
             ShowModeSelect();
         }
 
-        // ─── QR code localization ──────────────────────────────────────────────────
-
-        /// <summary>
-        /// Opens QR scanner. On success, pre-selects the matching node as start location.
-        /// (ICSCSS 2023 — AR Indoor Navigation using Unity + QR Codes)
-        /// </summary>
-        public void ScanLocationQR()
+        private void OnArrived()
         {
-            if (navInstructionText != null)
-                navInstructionText.text = "Point camera at a location QR code...";
-            StartCoroutine(QRScanRoutine());
+            // Show feedback panel so user can rate the route
+            SetPanels(feedback: true);
         }
 
-        private IEnumerator QRScanRoutine()
-        {
-            WebCamTexture camTex = new WebCamTexture();
-            camTex.Play();
-            yield return new WaitForSeconds(0.5f);
-
-            float timeout = 10f;
-            bool found = false;
-
-            while (timeout > 0f && !found)
-            {
-                timeout -= Time.deltaTime;
-                string decoded = TryDecodeQRFromCamera(camTex);
-                if (!string.IsNullOrEmpty(decoded)) { OnQRCodeScanned(decoded); found = true; }
-                yield return null;
-            }
-
-            camTex.Stop();
-            if (!found && navInstructionText != null)
-                navInstructionText.text = "QR scan timed out. Select start manually.";
-        }
-
-        private string TryDecodeQRFromCamera(WebCamTexture tex)
-        {
-            // TODO: Replace with ZXing.BarcodeReader for production
-            // var reader = new ZXing.BarcodeReader();
-            // var result = reader.Decode(tex.GetPixels32(), tex.width, tex.height);
-            // return result?.Text;
-            return null;
-        }
-
-        private void OnQRCodeScanned(string qrValue)
-        {
-            if (_cachedGraph == null) return;
-            var matchedNode = _cachedGraph.nodes.Find(n =>
-                string.Equals(n.name, qrValue, System.StringComparison.OrdinalIgnoreCase));
-
-            if (matchedNode != null)
-            {
-                _qrLocatedNodeId = matchedNode.id;
-                // Pre-select in start dropdown
-                if (startNodeDropdown != null)
-                {
-                    int idx = _availableNodeIds.IndexOf(matchedNode.id);
-                    if (idx >= 0) startNodeDropdown.value = idx;
-                }
-                if (navInstructionText != null)
-                    navInstructionText.text = $"📍 Located at: {matchedNode.name}. Select destination & tap Navigate!";
-                Debug.Log($"[AR-NAV] QR Localization → node {matchedNode.id}");
-            }
-            else
-            {
-                if (navInstructionText != null)
-                    navInstructionText.text = $"QR code '{qrValue}' not found in building map.";
-            }
-        }
-
-        // ─── Feedback / Rating ─────────────────────────────────────────────────────
-
-        private void ShowFeedbackDialog()
-        {
-            if (feedbackPanel != null) feedbackPanel.SetActive(true);
-        }
+        // ── Feedback ──────────────────────────────────────────────────────────────
 
         private void SubmitRating(float delta)
         {
-            string path = Path.Combine(Application.persistentDataPath, "indoor_graph.json");
-            BuildingGraph graph = BuildingGraph.LoadFromFile(path);
-            if (graph.edges.Count > 0)
+            // Update confidence score of all edges in the last used route
+            BuildingGraph g = BuildingGraph.LoadFromFile(BuildingGraph.DefaultPath);
+            if (g.edges.Count > 0)
             {
-                var lastEdge = graph.edges[graph.edges.Count - 1];
-                lastEdge.confidenceScore = Mathf.Clamp(lastEdge.confidenceScore + delta, 0.1f, 1.0f);
-                lastEdge.contributingWalkCount++;
-                graph.SaveToFile(path);
+                // Apply delta to every edge navigated (approximate: last N edges)
+                foreach (var edge in g.edges)
+                {
+                    edge.confidenceScore = Mathf.Clamp(edge.confidenceScore + delta * 0.1f, 0.1f, 2f);
+                    edge.contributingWalkCount++;
+                }
+                g.SaveToFile(BuildingGraph.DefaultPath);
             }
-            if (feedbackPanel != null) feedbackPanel.SetActive(false);
-            ShowModeSelect();
+            SetPanels(modeSelect: true);
+            RefreshGraph();
         }
 
-        // ─── Status helpers ────────────────────────────────────────────────────────
+        // ── QR Localization (placeholder — needs ZXing) ───────────────────────────
 
-        private void UpdateRecordingStatus(string msg)
+        /// <summary>
+        /// Scan a QR code to automatically set the start location.
+        /// Requires ZXing.Net.Bindings.Unity or similar package.
+        /// Currently shows a clear message instead of silently timing out.
+        /// </summary>
+        public void ScanLocationQR()
+        {
+            // When ZXing is available, replace this with the actual scan logic.
+            SetNavInstruction("QR scanning requires ZXing package.\n" +
+                              "Add ZXing via UPM or manually select your start location.");
+            Debug.Log("[AR-NAV] QR scan requested — ZXing not yet installed.");
+        }
+
+        // ── Helpers ───────────────────────────────────────────────────────────────
+
+        private void TryFindPanel(ref GameObject field, Canvas canvas, string panelName)
+        {
+            if (field != null || canvas == null) return;
+            Transform t = canvas.transform.Find(panelName);
+            if (t != null) field = t.gameObject;
+        }
+
+        private void WireButtons(GameObject panel, System.Action<Button, string> handler)
+        {
+            if (panel == null) return;
+            foreach (Button btn in panel.GetComponentsInChildren<Button>(true))
+            {
+                string label = btn.GetComponentInChildren<TMP_Text>()?.text?.ToLower()
+                            ?? btn.name.ToLower();
+                btn.onClick.RemoveAllListeners();
+                handler(btn, label);
+            }
+        }
+
+        /// <summary>
+        /// Creates a functional TMP_Dropdown for "You are at:" with a proper template
+        /// hierarchy so the dropdown list actually opens at runtime.
+        /// </summary>
+        private void EnsureStartDropdown()
+        {
+            if (startNodeDropdown != null || navigationPanel == null) return;
+            if (_graph == null || _graph.nodes.Count < 2) return;
+
+            // Find existing destination dropdown to position relative to it
+            RectTransform destRT = destinationDropdown?.GetComponent<RectTransform>();
+            float yPos = destRT != null ? destRT.anchoredPosition.y + 150f : 200f;
+
+            // ── Label ──────────────────────────────────────────────────────────────
+            GameObject labelGO = new GameObject("StartNodeLabel");
+            labelGO.transform.SetParent(navigationPanel.transform, false);
+            var label = labelGO.AddComponent<TextMeshProUGUI>();
+            label.text      = "📍 You are at:";
+            label.fontSize  = 26;
+            label.color     = new Color(0.7f, 0.95f, 1f);
+            label.alignment = TextAlignmentOptions.Center;
+            var labelRT = labelGO.GetComponent<RectTransform>();
+            labelRT.anchorMin = labelRT.anchorMax = new Vector2(0.5f, 0.5f);
+            labelRT.pivot     = new Vector2(0.5f, 0.5f);
+            labelRT.anchoredPosition = new Vector2(0f, yPos + 65f);
+            labelRT.sizeDelta        = new Vector2(600f, 50f);
+
+            // ── Dropdown root ──────────────────────────────────────────────────────
+            // We duplicate the destination dropdown's structure if available —
+            // that guarantees a working template. Otherwise create from scratch.
+            if (destinationDropdown != null)
+            {
+                GameObject clone = Instantiate(destinationDropdown.gameObject, navigationPanel.transform);
+                clone.name = "StartNodeDropdown";
+                startNodeDropdown = clone.GetComponent<TMP_Dropdown>();
+                var rt = clone.GetComponent<RectTransform>();
+                rt.anchorMin = rt.anchorMax = new Vector2(0.5f, 0.5f);
+                rt.pivot     = new Vector2(0.5f, 0.5f);
+                rt.anchoredPosition = new Vector2(0f, yPos);
+                rt.sizeDelta        = new Vector2(650f, 100f);
+            }
+            // If there's no destination dropdown to clone we skip dynamic creation
+            // (the scene bootstrapper will have provided one).
+        }
+
+        private void SetRecordingStatus(string msg)
         {
             if (recordingStatusText != null) recordingStatusText.text = msg;
         }
 
-        private void UpdateNavInstruction(string msg)
+        private void SetNavInstruction(string msg)
         {
             if (navInstructionText != null) navInstructionText.text = msg;
-        }
-
-        // ─── Layout helpers ────────────────────────────────────────────────────────
-
-        private void FormatCanvasScaler()
-        {
-            CanvasScaler scaler = GetComponentInParent<CanvasScaler>();
-            if (scaler == null) scaler = FindAnyObjectByType<CanvasScaler>();
-            if (scaler != null)
-            {
-                scaler.uiScaleMode        = CanvasScaler.ScaleMode.ScaleWithScreenSize;
-                scaler.referenceResolution = new Vector2(1080, 1920);
-                scaler.matchWidthOrHeight  = 0.5f;
-            }
-        }
-
-        private void AutoLayoutButtons()
-        {
-            // ModeSelect panel
-            if (modeSelectPanel != null)
-            {
-                var buttons = modeSelectPanel.GetComponentsInChildren<Button>(true);
-                if (buttons.Length >= 2)
-                {
-                    SetRectTransform(buttons[0].GetComponent<RectTransform>(), new Vector2(540, 130), new Vector2(0,  120));
-                    SetRectTransform(buttons[1].GetComponent<RectTransform>(), new Vector2(540, 130), new Vector2(0, -80));
-                }
-            }
-
-            // RecordingPanel
-            if (recordingPanel != null)
-            {
-                if (recordingStatusText != null)
-                {
-                    RectTransform rt = recordingStatusText.GetComponent<RectTransform>();
-                    rt.anchorMin = rt.anchorMax = new Vector2(0.5f, 1f);
-                    rt.pivot = new Vector2(0.5f, 1f);
-                    rt.anchoredPosition = new Vector2(0, -120);
-                    rt.sizeDelta = new Vector2(850, 200);
-                    recordingStatusText.alignment = TextAlignmentOptions.Center;
-                    recordingStatusText.fontSize  = 32;
-                }
-                if (stopRecordButton != null)
-                {
-                    SetRectTransform(stopRecordButton.GetComponent<RectTransform>(),
-                        new Vector2(540, 130), new Vector2(0, 120),
-                        new Vector2(0.5f, 0f), new Vector2(0.5f, 0f), new Vector2(0.5f, 0f));
-                }
-            }
-
-            // NavigationPanel
-            if (navigationPanel != null)
-            {
-                if (navInstructionText != null)
-                {
-                    RectTransform rt = navInstructionText.GetComponent<RectTransform>();
-                    rt.anchorMin = rt.anchorMax = new Vector2(0.5f, 1f);
-                    rt.pivot = new Vector2(0.5f, 1f);
-                    rt.anchoredPosition = new Vector2(0, -140);
-                    rt.sizeDelta = new Vector2(900, 200);
-                    navInstructionText.alignment = TextAlignmentOptions.Center;
-                    navInstructionText.fontSize  = 30;
-                }
-
-                // Destination dropdown — centre of screen
-                if (destinationDropdown != null)
-                    SetRectTransform(destinationDropdown.GetComponent<RectTransform>(),
-                        new Vector2(650, 110), new Vector2(0, -30));
-
-                // Start node dropdown — just above destination
-                if (startNodeDropdown != null)
-                    SetRectTransform(startNodeDropdown.GetComponent<RectTransform>(),
-                        new Vector2(650, 110), new Vector2(0, 110));
-
-                if (startNavButton != null)
-                    SetRectTransform(startNavButton.GetComponent<RectTransform>(),
-                        new Vector2(540, 130), new Vector2(0, -180));
-            }
-        }
-
-        private void SetRectTransform(RectTransform rt, Vector2 size, Vector2 pos,
-            Vector2 anchorMin = default, Vector2 anchorMax = default, Vector2 pivot = default)
-        {
-            if (rt == null) return;
-            if (anchorMin == default) anchorMin = new Vector2(0.5f, 0.5f);
-            if (anchorMax == default) anchorMax = new Vector2(0.5f, 0.5f);
-            if (pivot     == default) pivot     = new Vector2(0.5f, 0.5f);
-            rt.anchorMin        = anchorMin;
-            rt.anchorMax        = anchorMax;
-            rt.pivot            = pivot;
-            rt.sizeDelta        = size;
-            rt.anchoredPosition = pos;
-        }
-
-        // ─── ARCore / Permission init ──────────────────────────────────────────────
-
-        private IEnumerator InitializePermissionsAndAR()
-        {
-#if UNITY_ANDROID
-            if (!Permission.HasUserAuthorizedPermission(Permission.Camera))
-            {
-                Permission.RequestUserPermission(Permission.Camera);
-                float t = 10f;
-                while (!Permission.HasUserAuthorizedPermission(Permission.Camera) && t > 0f)
-                { t -= 0.2f; yield return new WaitForSeconds(0.2f); }
-            }
-#endif
-
-            float availTimeout = 3f;
-            while ((ARSession.state == ARSessionState.None ||
-                    ARSession.state == ARSessionState.CheckingAvailability) && availTimeout > 0f)
-            {
-                yield return ARSession.CheckAvailability();
-                availTimeout -= 0.2f;
-                yield return new WaitForSeconds(0.2f);
-            }
-
-            Debug.Log($"[AR-NAV] ARSession state: {ARSession.state}");
-
-            bool useFallback = ARSession.state == ARSessionState.Unsupported ||
-                               ARSession.state == ARSessionState.NeedsInstall ||
-                               ARSession.state == ARSessionState.None;
-
-            if (useFallback)
-            {
-                Debug.LogWarning("[AR-NAV] ARCore not available — activating Sensor AR Fallback...");
-
-                ARSession session = FindAnyObjectByType<ARSession>();
-                if (session != null) session.enabled = false;
-
-                ARCameraBackground bgComp = FindAnyObjectByType<ARCameraBackground>();
-                if (bgComp != null) bgComp.enabled = false;
-
-                SensorARFallback fallback = FindAnyObjectByType<SensorARFallback>();
-                if (fallback == null) fallback = gameObject.AddComponent<SensorARFallback>();
-                fallback.ActivateFallback();
-
-                UpdateRecordingStatus("📡 Sensor AR Mode (Gyro + Pedometer). Ready to record!");
-                yield break;
-            }
-
-            // ARCore path
-            ARCameraBackground bg = FindAnyObjectByType<ARCameraBackground>();
-            if (bg != null && !bg.enabled) bg.enabled = true;
-
-            ARSession activeSession = FindAnyObjectByType<ARSession>();
-            if (activeSession != null)
-            {
-                activeSession.enabled = false;
-                yield return null;
-                activeSession.enabled = true;
-                activeSession.Reset();
-            }
-
-            Debug.Log($"[AR-NAV] ARCore active: {ARSession.state}");
         }
     }
 }

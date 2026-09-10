@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.IO;
 using UnityEngine;
 using ARNav.Graph;
 using ARNav.Utils;
@@ -8,171 +7,231 @@ using ARNav.Utils;
 namespace ARNav.Recording
 {
     /// <summary>
-    /// Records user paths by sampling AR Camera position/rotation at distance and angle thresholds,
-    /// segments paths with anchors every 5-10 meters to eliminate drift, simplifies points using RDP,
-    /// and saves to the local building graph.
+    /// Records the user's physical walk via the AR camera transform.
+    ///
+    /// FLOW (correct order, fixes the old inversion bug):
+    ///   1. UI opens the Recording panel — user fills in start name.
+    ///   2. User taps "Start Recording" → StartRecording() is called.
+    ///   3. User walks to destination.
+    ///   4. User taps "Finish & Save" → StopAndSave() is called with the end name.
+    ///
+    /// KEY FIXES vs old version:
+    ///   • Node IDs are GUIDs → no cross-session collision.
+    ///   • buildingId is a parameter the caller provides, not hard-coded.
+    ///   • StartRecording / StopAndSave are clearly separate methods.
+    ///   • All session nodes/edges are uploaded, not just the last one.
     /// </summary>
     public class PathRecorder : MonoBehaviour
     {
+        // ── Inspector ─────────────────────────────────────────────────────────────
         [Header("References")]
-        [SerializeField] private Transform arCamera;
+        [Tooltip("Assign Camera.main's transform, or leave null to auto-find on Start.")]
+        [SerializeField] public Transform arCamera;
 
-        [Header("Sampling Settings")]
-        [Tooltip("Minimum distance in meters between captured waypoints.")]
-        [SerializeField] private float minDistanceSample = 0.5f;
+        [Header("Sampling")]
+        [Tooltip("Minimum metres to travel before a new point is recorded.")]
+        [SerializeField] private float minDistanceMetres = 0.5f;
 
-        [Tooltip("Minimum rotation change in degrees to capture a waypoint (e.g. sharp turns).")]
-        [SerializeField] private float minAngleSample = 15f;
+        [Tooltip("Minimum degrees the camera must rotate before a new point is recorded.")]
+        [SerializeField] private float minAngleDegrees = 15f;
 
-        [Tooltip("Distance in meters between automatic anchor checkpoints.")]
-        [SerializeField] private float anchorIntervalMeters = 8f;
+        [Tooltip("An intermediate anchor node is dropped every this many metres.")]
+        [SerializeField] private float anchorEveryMetres = 8f;
 
-        [Tooltip("Tolerance for Douglas-Peucker simplification in meters.")]
-        [SerializeField] private float simplificationTolerance = 0.15f;
+        [Tooltip("RDP simplification tolerance in metres (lower = more points kept).")]
+        [SerializeField] private float simplifyTolerance = 0.15f;
 
-        // Runtime Recording State
-        private bool _isRecording = false;
-        private Vector3 _lastRecordedPos;
-        private Quaternion _lastRecordedRot;
-        private float _distanceSinceLastAnchor = 0f;
-        private int _anchorCount = 0;
+        // ── Public state ──────────────────────────────────────────────────────────
+        public bool IsRecording        => _recording;
+        public int  AnchorCount        => _anchorCount;
+        public int  RecordedPointCount => _segmentPts.Count;
+        public float TotalDistance     => _totalDist;
 
-        private List<Vector3> _currentSegmentPoints = new List<Vector3>();
+        // ── Events ────────────────────────────────────────────────────────────────
+        /// <summary>Fires with a human-readable status string (show in UI).</summary>
+        public event Action<string>      OnStatusChanged;
+        /// <summary>Fires every sample tick: (pointCount, totalDistanceMetres).</summary>
+        public event Action<int, float>  OnProgress;
+
+        // ── Private state ─────────────────────────────────────────────────────────
+        private bool   _recording;
+        private float  _totalDist;
+        private float  _distSinceAnchor;
+        private int    _anchorCount;
+        private Vector3    _lastPos;
+        private Quaternion _lastRot;
+
+        private List<Vector3>   _segmentPts   = new List<Vector3>();
         private List<GraphNode> _sessionNodes = new List<GraphNode>();
         private List<GraphEdge> _sessionEdges = new List<GraphEdge>();
-        private GraphNode _lastNode = null;
+        private GraphNode _tailNode; // last committed anchor node
 
-        public bool IsRecording => _isRecording;
-        public int RecordedPointCount => _currentSegmentPoints.Count;
-        public int AnchorCount => _anchorCount;
-
-        public event Action<string> OnStatusChanged;
-        public event Action<int, float> OnRecordingProgress; // (pointCount, totalDistance)
-        private float _totalDistanceWalked = 0f;
+        // ── Lifecycle ─────────────────────────────────────────────────────────────
 
         private void Start()
         {
             if (arCamera == null && Camera.main != null)
-            {
                 arCamera = Camera.main.transform;
-            }
-        }
-
-        public void StartRecording(string startNodeName = "StartPoint", string buildingId = "main_building", int floor = 1)
-        {
-            if (arCamera == null)
-            {
-                OnStatusChanged?.Invoke("Error: AR Camera reference not found!");
-                return;
-            }
-
-            _isRecording = true;
-            _totalDistanceWalked = 0f;
-            _distanceSinceLastAnchor = 0f;
-            _anchorCount = 0;
-            _currentSegmentPoints.Clear();
-            _sessionNodes.Clear();
-            _sessionEdges.Clear();
-
-            _lastRecordedPos = arCamera.position;
-            _lastRecordedRot = arCamera.rotation;
-
-            // Create initial start node with anchor
-            _anchorCount++;
-            string startAnchorId = $"anchor_{Guid.NewGuid().ToString().Substring(0, 8)}";
-            string startNodeId = $"node_{_anchorCount}";
-            _lastNode = new GraphNode(startNodeId, startNodeName, buildingId, floor, _lastRecordedPos, startAnchorId);
-            _sessionNodes.Add(_lastNode);
-
-            _currentSegmentPoints.Add(_lastRecordedPos);
-
-            OnStatusChanged?.Invoke($"Recording started at {_lastNode.name} (Anchor: {startAnchorId})");
         }
 
         private void Update()
         {
-            if (!_isRecording || arCamera == null) return;
+            if (!_recording || arCamera == null) return;
 
-            Vector3 currentPos = arCamera.position;
+            Vector3    currentPos = arCamera.position;
             Quaternion currentRot = arCamera.rotation;
 
-            float distDelta = Vector3.Distance(currentPos, _lastRecordedPos);
-            float angleDelta = Quaternion.Angle(currentRot, _lastRecordedRot);
+            float distDelta  = Vector3.Distance(currentPos, _lastPos);
+            float angleDelta = Quaternion.Angle(currentRot, _lastRot);
 
-            if (distDelta >= minDistanceSample || angleDelta >= minAngleSample)
-            {
-                _currentSegmentPoints.Add(currentPos);
-                _totalDistanceWalked += distDelta;
-                _distanceSinceLastAnchor += distDelta;
+            if (distDelta < minDistanceMetres && angleDelta < minAngleDegrees) return;
 
-                _lastRecordedPos = currentPos;
-                _lastRecordedRot = currentRot;
+            // Record sample
+            _segmentPts.Add(currentPos);
+            _totalDist       += distDelta;
+            _distSinceAnchor += distDelta;
+            _lastPos = currentPos;
+            _lastRot = currentRot;
 
-                OnRecordingProgress?.Invoke(_currentSegmentPoints.Count, _totalDistanceWalked);
+            OnProgress?.Invoke(_segmentPts.Count, _totalDist);
 
-                // Auto-drop intermediate anchor every 5-10m
-                if (_distanceSinceLastAnchor >= anchorIntervalMeters)
-                {
-                    CommitIntermediateAnchor();
-                }
-            }
+            if (_distSinceAnchor >= anchorEveryMetres)
+                CommitIntermediateAnchor();
         }
+
+        // ── Public API ────────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Begin a new recording session.
+        /// Call this when the user explicitly taps "Start Recording".
+        /// </summary>
+        /// <param name="startName">Name of the starting location (shown in dropdowns).</param>
+        /// <param name="buildingId">Identifier for the building (used in Supabase grouping).</param>
+        /// <param name="floor">Floor number.</param>
+        public void StartRecording(string startName, string buildingId = "main_building", int floor = 1)
+        {
+            if (_recording)
+            {
+                OnStatusChanged?.Invoke("Already recording — tap Finish first.");
+                return;
+            }
+            if (arCamera == null)
+            {
+                OnStatusChanged?.Invoke("Error: AR Camera not found. Cannot record.");
+                return;
+            }
+
+            // Reset all session state
+            _recording        = true;
+            _totalDist        = 0f;
+            _distSinceAnchor  = 0f;
+            _anchorCount      = 0;
+            _segmentPts.Clear();
+            _sessionNodes.Clear();
+            _sessionEdges.Clear();
+
+            _lastPos = arCamera.position;
+            _lastRot = arCamera.rotation;
+
+            // Create the start node — GUID id, no collision ever
+            _tailNode = new GraphNode(startName, buildingId, floor, _lastPos);
+            _sessionNodes.Add(_tailNode);
+            _anchorCount++;
+
+            _segmentPts.Add(_lastPos);
+
+            OnStatusChanged?.Invoke($"🔴 Recording from '{startName}'. Walk to your destination.");
+        }
+
+        /// <summary>
+        /// Finish recording, commit the final node, merge into the persistent graph,
+        /// and return the updated graph.
+        /// Call this when the user taps "Finish & Save".
+        /// </summary>
+        /// <param name="endName">Name of the destination location.</param>
+        /// <param name="overrideSavePath">Optional custom path — null uses default.</param>
+        /// <returns>The merged BuildingGraph, or null if not recording.</returns>
+        public BuildingGraph StopAndSave(string endName, string overrideSavePath = null)
+        {
+            if (!_recording)
+            {
+                OnStatusChanged?.Invoke("Not recording.");
+                return null;
+            }
+            _recording = false;
+
+            // Commit final destination node
+            GraphNode endNode = new GraphNode(
+                endName,
+                _tailNode.buildingId,
+                _tailNode.floor,
+                _lastPos
+            );
+            _sessionNodes.Add(endNode);
+            _anchorCount++;
+
+            // Commit final segment edge
+            List<Vector3> simplified = PathSimplifier.Simplify(_segmentPts, simplifyTolerance);
+            _sessionEdges.Add(new GraphEdge(_tailNode.id, endNode.id, simplified));
+
+            // Merge into persistent graph
+            string savePath = string.IsNullOrEmpty(overrideSavePath)
+                ? BuildingGraph.DefaultPath
+                : overrideSavePath;
+
+            BuildingGraph graph = BuildingGraph.LoadFromFile(savePath);
+            foreach (var n in _sessionNodes) graph.AddNode(n);
+            foreach (var e in _sessionEdges) graph.AddEdge(e);
+            graph.SaveToFile(savePath);
+
+            OnStatusChanged?.Invoke(
+                $"✅ Saved '{_tailNode.name}' → '{endNode.name}' " +
+                $"({_sessionNodes.Count} nodes, {_sessionEdges.Count} edges, {_totalDist:F1} m)"
+            );
+            return graph;
+        }
+
+        /// <summary>Cancel a recording in progress without saving.</summary>
+        public void CancelRecording()
+        {
+            _recording = false;
+            _sessionNodes.Clear();
+            _sessionEdges.Clear();
+            _segmentPts.Clear();
+            OnStatusChanged?.Invoke("Recording cancelled.");
+        }
+
+        /// <summary>
+        /// All nodes recorded this session. Useful for uploading all edges to
+        /// Supabase after StopAndSave().
+        /// </summary>
+        public IReadOnlyList<GraphNode> SessionNodes => _sessionNodes;
+
+        /// <summary>All edges recorded this session.</summary>
+        public IReadOnlyList<GraphEdge> SessionEdges => _sessionEdges;
+
+        // ── Internals ─────────────────────────────────────────────────────────────
 
         private void CommitIntermediateAnchor()
         {
-            _anchorCount++;
-            string anchorId = $"anchor_{Guid.NewGuid().ToString().Substring(0, 8)}";
-            string nodeId = $"node_{_anchorCount}";
-
-            GraphNode newNode = new GraphNode(nodeId, $"Waypoint {_anchorCount}", _lastNode.buildingId, _lastNode.floor, _lastRecordedPos, anchorId);
+            GraphNode newNode = new GraphNode(
+                $"Waypoint {_anchorCount}",
+                _tailNode.buildingId,
+                _tailNode.floor,
+                _lastPos
+            );
             _sessionNodes.Add(newNode);
-
-            // Simplify segment points before storing into edge
-            List<Vector3> simplified = PathSimplifier.Simplify(_currentSegmentPoints, simplificationTolerance);
-            string edgeId = $"edge_{_lastNode.id}_{newNode.id}";
-            GraphEdge edge = new GraphEdge(edgeId, _lastNode.id, newNode.id, simplified);
-            _sessionEdges.Add(edge);
-
-            // Reset segment buffer for next anchor
-            _currentSegmentPoints.Clear();
-            _currentSegmentPoints.Add(_lastRecordedPos); // Start next segment at current position
-            _lastNode = newNode;
-            _distanceSinceLastAnchor = 0f;
-
-            OnStatusChanged?.Invoke($"Anchor {_anchorCount} dropped ({simplified.Count} pts simplified)");
-        }
-
-        public BuildingGraph StopAndSaveRecording(string endNodeName = "Destination", string savePath = null)
-        {
-            if (!_isRecording) return null;
-            _isRecording = false;
-
-            // Commit final destination node
             _anchorCount++;
-            string endAnchorId = $"anchor_{Guid.NewGuid().ToString().Substring(0, 8)}";
-            string endNodeId = $"node_{_anchorCount}";
 
-            GraphNode endNode = new GraphNode(endNodeId, endNodeName, _lastNode.buildingId, _lastNode.floor, _lastRecordedPos, endAnchorId);
-            _sessionNodes.Add(endNode);
+            List<Vector3> simplified = PathSimplifier.Simplify(_segmentPts, simplifyTolerance);
+            _sessionEdges.Add(new GraphEdge(_tailNode.id, newNode.id, simplified));
 
-            List<Vector3> simplified = PathSimplifier.Simplify(_currentSegmentPoints, simplificationTolerance);
-            string edgeId = $"edge_{_lastNode.id}_{endNode.id}";
-            GraphEdge finalEdge = new GraphEdge(edgeId, _lastNode.id, endNode.id, simplified);
-            _sessionEdges.Add(finalEdge);
+            _segmentPts.Clear();
+            _segmentPts.Add(_lastPos); // new segment starts at current pos
+            _tailNode             = newNode;
+            _distSinceAnchor      = 0f;
 
-            // Merge into persistent graph
-            string targetPath = string.IsNullOrEmpty(savePath) 
-                ? Path.Combine(Application.persistentDataPath, "indoor_graph.json") 
-                : savePath;
-
-            BuildingGraph graph = BuildingGraph.LoadFromFile(targetPath);
-            foreach (var node in _sessionNodes) graph.AddNode(node);
-            foreach (var edge in _sessionEdges) graph.AddEdge(edge);
-
-            graph.SaveToFile(targetPath);
-
-            OnStatusChanged?.Invoke($"Saved route to {targetPath}: {_sessionNodes.Count} nodes, {_sessionEdges.Count} edges, {_totalDistanceWalked:F1}m");
-            return graph;
+            OnStatusChanged?.Invoke($"Anchor {_anchorCount} dropped ({simplified.Count} pts)");
         }
     }
 }
