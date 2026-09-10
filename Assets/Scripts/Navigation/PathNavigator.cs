@@ -172,6 +172,12 @@ namespace ARNav.Navigation
             }
         }
 
+        /// <summary>
+        /// Updates turn-by-turn instructions.
+        /// When the user is within 3m of the current waypoint, pre-announces the NEXT turn direction
+        /// so they have time to react before reaching the junction.
+        /// (Based on: ISMSIT 2020 — Mobile AR-based Indoor Navigation System)
+        /// </summary>
         private void UpdateGuidanceText()
         {
             if (_currentPointIndex >= _flattenedRoutePoints.Count) return;
@@ -179,15 +185,39 @@ namespace ARNav.Navigation
             Vector3 targetPt = _flattenedRoutePoints[_currentPointIndex];
             float dist = Vector3.Distance(arCamera.position, targetPt);
 
+            // --- Current turn direction ---
             Vector3 toTarget = (targetPt - arCamera.position).normalized;
             float angle = Vector3.SignedAngle(arCamera.forward, toTarget, Vector3.up);
+            string currentDirection = AngleToDirection(angle);
 
-            string direction = "Walk straight";
-            if (angle > 35f && angle < 135f) direction = "Turn right";
-            else if (angle < -35f && angle > -135f) direction = "Turn left";
-            else if (Mathf.Abs(angle) >= 135f) direction = "Turn around";
+            // --- Look-ahead: pre-announce NEXT turn when within 3m of this waypoint (Paper 5) ---
+            bool hasNextWaypoint = (_currentPointIndex + 1) < _flattenedRoutePoints.Count;
+            if (dist <= 3f && hasNextWaypoint)
+            {
+                Vector3 nextPt = _flattenedRoutePoints[_currentPointIndex + 1];
+                // The upcoming turn angle at the junction
+                Vector3 incomingDir = (targetPt - arCamera.position).normalized;
+                Vector3 outgoingDir = (nextPt - targetPt).normalized;
+                float nextAngle = Vector3.SignedAngle(incomingDir, outgoingDir, Vector3.up);
+                string nextDirection = AngleToDirection(nextAngle);
 
-            OnInstructionChanged?.Invoke($"{direction} ({dist:F1}m)");
+                if (nextDirection != "Walk straight")
+                    OnInstructionChanged?.Invoke($"{currentDirection} ({dist:F1}m) → then {nextDirection} ahead");
+                else
+                    OnInstructionChanged?.Invoke($"{currentDirection} ({dist:F1}m)");
+            }
+            else
+            {
+                OnInstructionChanged?.Invoke($"{currentDirection} ({dist:F1}m)");
+            }
+        }
+
+        private string AngleToDirection(float angle)
+        {
+            if (angle > 35f && angle < 135f)   return "Turn right";
+            if (angle < -35f && angle > -135f)  return "Turn left";
+            if (Mathf.Abs(angle) >= 135f)       return "Turn around";
+            return "Walk straight";
         }
 
         public void StopNavigation()

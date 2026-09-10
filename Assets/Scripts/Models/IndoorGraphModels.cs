@@ -123,69 +123,85 @@ namespace ARNav.Graph
             return edges.FindAll(e => e.nodeA == nodeId || e.nodeB == nodeId);
         }
 
+        /// <summary>
+        /// A* pathfinding: uses straight-line distance to goal as heuristic to guide search,
+        /// dramatically reducing explored nodes vs plain Dijkstra in large building graphs.
+        /// (Based on: IJRASET 2023 — AR Indoor Navigation with Graph Pathfinding)
+        /// </summary>
         public List<GraphEdge> FindRoute(string startNodeId, string targetNodeId)
         {
             if (startNodeId == targetNodeId) return new List<GraphEdge>();
 
-            var distances = new Dictionary<string, float>();
+            if (!nodes.Exists(n => n.id == startNodeId) || !nodes.Exists(n => n.id == targetNodeId))
+                return null;
+
+            GraphNode targetNode = GetNode(targetNodeId);
+
+            // g = actual cost from start; f = g + heuristic (A*)
+            var gScore = new Dictionary<string, float>();
+            var fScore = new Dictionary<string, float>();
             var previousNode = new Dictionary<string, string>();
             var previousEdge = new Dictionary<string, GraphEdge>();
-            var unvisited = new HashSet<string>();
+            var openSet = new HashSet<string>();
+            var closedSet = new HashSet<string>();
 
             foreach (var node in nodes)
             {
-                distances[node.id] = float.MaxValue;
-                unvisited.Add(node.id);
+                gScore[node.id] = float.MaxValue;
+                fScore[node.id] = float.MaxValue;
             }
 
-            if (!distances.ContainsKey(startNodeId) || !distances.ContainsKey(targetNodeId))
-                return null;
+            gScore[startNodeId] = 0f;
+            fScore[startNodeId] = Heuristic(GetNode(startNodeId), targetNode);
+            openSet.Add(startNodeId);
 
-            distances[startNodeId] = 0f;
-
-            while (unvisited.Count > 0)
+            while (openSet.Count > 0)
             {
+                // Pick node in openSet with lowest fScore
                 string current = null;
-                float minDistance = float.MaxValue;
-
-                foreach (var candidate in unvisited)
+                float minF = float.MaxValue;
+                foreach (var candidate in openSet)
                 {
-                    if (distances[candidate] < minDistance)
+                    if (fScore[candidate] < minF)
                     {
-                        minDistance = distances[candidate];
+                        minF = fScore[candidate];
                         current = candidate;
                     }
                 }
 
-                if (current == null || minDistance == float.MaxValue) break;
+                if (current == null) break;
                 if (current == targetNodeId) break;
 
-                unvisited.Remove(current);
+                openSet.Remove(current);
+                closedSet.Add(current);
 
                 foreach (var edge in GetConnectedEdges(current))
                 {
                     string neighbor = (edge.nodeA == current) ? edge.nodeB : edge.nodeA;
-                    if (!unvisited.Contains(neighbor)) continue;
+                    if (closedSet.Contains(neighbor)) continue;
 
+                    // Edge cost weighted by confidence score (lower confidence = higher effective cost)
                     float edgeCost = edge.CalculateLength();
                     if (edge.confidenceScore > 0f)
-                    {
                         edgeCost /= Mathf.Clamp(edge.confidenceScore, 0.2f, 2.0f);
-                    }
 
-                    float newDist = distances[current] + edgeCost;
-                    if (newDist < distances[neighbor])
-                    {
-                        distances[neighbor] = newDist;
-                        previousNode[neighbor] = current;
-                        previousEdge[neighbor] = edge;
-                    }
+                    float tentativeG = gScore[current] + edgeCost;
+
+                    if (!openSet.Contains(neighbor)) openSet.Add(neighbor);
+                    else if (tentativeG >= gScore[neighbor]) continue;
+
+                    // This path is better — record it
+                    previousNode[neighbor] = current;
+                    previousEdge[neighbor] = edge;
+                    gScore[neighbor] = tentativeG;
+                    fScore[neighbor] = tentativeG + Heuristic(GetNode(neighbor), targetNode);
                 }
             }
 
             if (!previousEdge.ContainsKey(targetNodeId))
                 return null;
 
+            // Reconstruct path
             var route = new List<GraphEdge>();
             string curr = targetNodeId;
             while (curr != startNodeId && previousEdge.TryGetValue(curr, out var edge))
@@ -195,6 +211,15 @@ namespace ARNav.Graph
             }
 
             return route;
+        }
+
+        /// <summary>
+        /// A* heuristic: straight-line (Euclidean) distance between two nodes' recorded positions.
+        /// </summary>
+        private float Heuristic(GraphNode a, GraphNode b)
+        {
+            if (a == null || b == null) return 0f;
+            return Vector3.Distance(a.localPosition.ToVector3(), b.localPosition.ToVector3());
         }
 
         public string ToJson() => JsonUtility.ToJson(this, true);

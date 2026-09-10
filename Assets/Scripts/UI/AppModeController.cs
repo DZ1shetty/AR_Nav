@@ -51,6 +51,11 @@ namespace ARNav.UI
         private BuildingGraph _cachedGraph;
         private List<string> _availableDestinations = new List<string>();
 
+        // QR Code Localization (Paper 2: ICSCSS 2023)
+        // Stores the node ID that was resolved from the last QR code scan.
+        // When set, navigation uses this as the start node instead of blindly using nodes[0].
+        private string _qrLocatedNodeId = null;
+
         private void Awake()
         {
             FormatCanvasScaler();
@@ -211,9 +216,107 @@ namespace ARNav.UI
             if (selectedIndex < 0 || selectedIndex >= _availableDestinations.Count) return;
 
             string targetNodeId = _availableDestinations[selectedIndex];
-            string startNodeId = _cachedGraph.nodes[0].id; // Default to first node / origin
+
+            // Paper 2: Use QR-scanned start node if available; otherwise fall back to first node.
+            string startNodeId = (!string.IsNullOrEmpty(_qrLocatedNodeId))
+                ? _qrLocatedNodeId
+                : _cachedGraph.nodes[0].id;
 
             navigator.StartNavigation(startNodeId, targetNodeId);
+        }
+
+        /// <summary>
+        /// Called by a UI Button in the Navigation Panel.
+        /// Opens the device camera briefly to scan a QR code placed at building entrances/rooms.
+        /// The QR code should encode the exact node name (e.g. "Main Entrance", "Lab 101").
+        /// (Based on: ICSCSS 2023 — AR Indoor Navigation using Unity Engine + QR Codes)
+        /// </summary>
+        public void ScanLocationQR()
+        {
+            if (navInstructionText != null)
+                navInstructionText.text = "Point camera at a location QR code...";
+
+            // Unity's WebCamTexture-based QR scanning:
+            // We start a coroutine that reads frames and tries to decode them.
+            // For a full production build, swap this with ZXing or a native plugin.
+            StartCoroutine(QRScanRoutine());
+        }
+
+        private System.Collections.IEnumerator QRScanRoutine()
+        {
+            // Use the back camera for QR scanning
+            WebCamTexture camTex = new WebCamTexture();
+            camTex.Play();
+            yield return new WaitForSeconds(0.5f); // Let camera warm up
+
+            float timeout = 10f;
+            bool found = false;
+
+            while (timeout > 0f && !found)
+            {
+                timeout -= Time.deltaTime;
+
+                // --- Simulated QR decode ---
+                // In production: pass camTex pixels to ZXing BarcodeReader.
+                // For now we demonstrate the localization flow with a placeholder.
+                string decoded = TryDecodeQRFromCamera(camTex);
+
+                if (!string.IsNullOrEmpty(decoded))
+                {
+                    OnQRCodeScanned(decoded);
+                    found = true;
+                }
+
+                yield return null;
+            }
+
+            camTex.Stop();
+
+            if (!found && navInstructionText != null)
+                navInstructionText.text = "QR scan timed out. Select start manually.";
+        }
+
+        /// <summary>
+        /// Placeholder: replace this method body with a real ZXing decode call
+        /// (ZXing.Net.Mobile or ZXing.Unity) that reads pixels from the WebCamTexture.
+        /// Returns the decoded string, or null if nothing readable yet.
+        /// </summary>
+        private string TryDecodeQRFromCamera(WebCamTexture tex)
+        {
+            // TODO: integrate ZXing.BarcodeReader here for production.
+            // Example:
+            //   var reader = new ZXing.BarcodeReader();
+            //   var result = reader.Decode(tex.GetPixels32(), tex.width, tex.height);
+            //   return result?.Text;
+            return null; // Stub — no actual QR lib linked yet
+        }
+
+        /// <summary>
+        /// Resolves a decoded QR string to a graph node and stores it as the navigation start.
+        /// </summary>
+        private void OnQRCodeScanned(string qrValue)
+        {
+            if (_cachedGraph == null) return;
+
+            // Match the QR value against recorded node names
+            var matchedNode = _cachedGraph.nodes.Find(n =>
+                string.Equals(n.name, qrValue, System.StringComparison.OrdinalIgnoreCase));
+
+            if (matchedNode != null)
+            {
+                _qrLocatedNodeId = matchedNode.id;
+                if (navInstructionText != null)
+                    navInstructionText.text = $"📍 Located at: {matchedNode.name}. Select destination and tap Navigate!";
+
+                Debug.Log($"[AR-NAV] QR Localization: resolved '{qrValue}' → node {matchedNode.id}");
+            }
+            else
+            {
+                if (navInstructionText != null)
+                    navInstructionText.text = $"QR code '{qrValue}' not found in building map. Walk to a known point.";
+
+                Debug.LogWarning($"[AR-NAV] QR value '{qrValue}' did not match any node name.");
+            }
         }
 
         private void OnStopNavClicked()
