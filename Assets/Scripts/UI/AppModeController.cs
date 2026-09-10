@@ -65,6 +65,8 @@ namespace ARNav.UI
         {
             StartCoroutine(InitializePermissionsAndAR());
             AutoLayoutButtons();
+            EnsureUIReferencesAndListeners();
+
             if (recorder == null) recorder = FindAnyObjectByType<PathRecorder>();
             if (navigator == null) navigator = FindAnyObjectByType<PathNavigator>();
             if (supabaseService == null) supabaseService = FindAnyObjectByType<ARNav.Backend.SupabaseSyncService>();
@@ -93,16 +95,171 @@ namespace ARNav.UI
                 navigator.OnDestinationReached += ShowFeedbackDialog;
             }
 
-            // Button listeners
-            if (startRecordButton != null) startRecordButton.onClick.AddListener(OnStartRecordClicked);
-            if (stopRecordButton != null) stopRecordButton.onClick.AddListener(OnStopRecordClicked);
-            if (startNavButton != null) startNavButton.onClick.AddListener(OnStartNavClicked);
-            if (stopNavButton != null) stopNavButton.onClick.AddListener(OnStopNavClicked);
-
-            if (thumbsUpButton != null) thumbsUpButton.onClick.AddListener(() => SubmitRating(1.0f));
-            if (thumbsDownButton != null) thumbsDownButton.onClick.AddListener(() => SubmitRating(-0.5f));
-
             ShowModeSelect();
+        }
+
+        private void EnsureUIReferencesAndListeners()
+        {
+            Canvas mainCanvas = GetComponentInParent<Canvas>();
+            if (mainCanvas == null) mainCanvas = FindAnyObjectByType<Canvas>();
+
+            // Auto-detect panels if unassigned
+            if (modeSelectPanel == null && mainCanvas != null)
+            {
+                var t = mainCanvas.transform.Find("ModeSelectPanel");
+                if (t != null) modeSelectPanel = t.gameObject;
+            }
+            if (recordingPanel == null && mainCanvas != null)
+            {
+                var t = mainCanvas.transform.Find("RecordingPanel");
+                if (t != null) recordingPanel = t.gameObject;
+            }
+            if (navigationPanel == null && mainCanvas != null)
+            {
+                var t = mainCanvas.transform.Find("NavigationPanel");
+                if (t != null) navigationPanel = t.gameObject;
+            }
+
+            // Fix NavigationPanel Hierarchy: unparent dropdown & start button if they were accidentally nested in text!
+            if (navigationPanel != null)
+            {
+                var allChildren = navigationPanel.GetComponentsInChildren<Transform>(true);
+                foreach (var child in allChildren)
+                {
+                    if (child == navigationPanel.transform) continue;
+                    // Move direct UI components directly under NavigationPanel
+                    if (child.GetComponent<Button>() != null || child.GetComponent<TMP_Dropdown>() != null)
+                    {
+                        child.SetParent(navigationPanel.transform, false);
+                    }
+                }
+            }
+
+            // Wire ModeSelect buttons
+            if (modeSelectPanel != null)
+            {
+                var btns = modeSelectPanel.GetComponentsInChildren<Button>(true);
+                foreach (var b in btns)
+                {
+                    string txt = b.GetComponentInChildren<TMP_Text>()?.text?.ToLower() ?? b.name.ToLower();
+                    b.onClick.RemoveAllListeners();
+                    if (txt.Contains("record"))
+                    {
+                        b.onClick.AddListener(OpenRecordMode);
+                        Debug.Log($"[AppModeController] Wired Record Mode button: {b.name}");
+                    }
+                    else if (txt.Contains("navigat"))
+                    {
+                        b.onClick.AddListener(OpenNavigateMode);
+                        Debug.Log($"[AppModeController] Wired Navigate Mode button: {b.name}");
+                    }
+                }
+            }
+
+            // Wire RecordingPanel Stop/Finish button & Back button
+            if (recordingPanel != null)
+            {
+                var btns = recordingPanel.GetComponentsInChildren<Button>(true);
+                foreach (var b in btns)
+                {
+                    string txt = b.GetComponentInChildren<TMP_Text>()?.text?.ToLower() ?? b.name.ToLower();
+                    b.onClick.RemoveAllListeners();
+                    if (txt.Contains("finish") || txt.Contains("save") || txt.Contains("stop"))
+                    {
+                        stopRecordButton = b;
+                        b.onClick.AddListener(OnStopRecordClicked);
+                        Debug.Log($"[AppModeController] Wired Stop/Finish Record button: {b.name}");
+                    }
+                    else if (txt.Contains("cancel") || txt.Contains("back"))
+                    {
+                        b.onClick.AddListener(CancelRecordingAndReturn);
+                    }
+                }
+
+                if (recordingStatusText == null)
+                {
+                    recordingStatusText = recordingPanel.GetComponentInChildren<TMP_Text>(true);
+                }
+            }
+
+            // Wire NavigationPanel buttons and dropdown
+            if (navigationPanel != null)
+            {
+                var navBtns = navigationPanel.GetComponentsInChildren<Button>(true);
+                foreach (var b in navBtns)
+                {
+                    string txt = b.GetComponentInChildren<TMP_Text>()?.text?.ToLower() ?? b.name.ToLower();
+                    b.onClick.RemoveAllListeners();
+                    if (txt.Contains("start") || txt.Contains("nav"))
+                    {
+                        startNavButton = b;
+                        b.onClick.AddListener(OnStartNavClicked);
+                        Debug.Log($"[AppModeController] Wired Start Nav button: {b.name}");
+                    }
+                    else if (txt.Contains("stop") || txt.Contains("cancel") || txt.Contains("back"))
+                    {
+                        stopNavButton = b;
+                        b.onClick.AddListener(OnStopNavClicked);
+                        Debug.Log($"[AppModeController] Wired Stop/Back Nav button: {b.name}");
+                    }
+                }
+
+                // Add or wire a Back button if one doesn't exist in NavigationPanel
+                EnsureBackButton(navigationPanel.transform, OnStopNavClicked);
+
+                if (destinationDropdown == null)
+                {
+                    destinationDropdown = navigationPanel.GetComponentInChildren<TMP_Dropdown>(true);
+                }
+                if (navInstructionText == null)
+                {
+                    navInstructionText = navigationPanel.GetComponentInChildren<TMP_Text>(true);
+                }
+            }
+
+            if (thumbsUpButton != null)
+            {
+                thumbsUpButton.onClick.RemoveAllListeners();
+                thumbsUpButton.onClick.AddListener(() => SubmitRating(1.0f));
+            }
+            if (thumbsDownButton != null)
+            {
+                thumbsDownButton.onClick.RemoveAllListeners();
+                thumbsDownButton.onClick.AddListener(() => SubmitRating(-0.5f));
+            }
+        }
+
+        private void EnsureBackButton(Transform parentPanel, UnityEngine.Events.UnityAction action)
+        {
+            var existing = parentPanel.Find("BackButton");
+            if (existing == null)
+            {
+                GameObject backObj = new GameObject("BackButton");
+                backObj.transform.SetParent(parentPanel, false);
+                Image img = backObj.AddComponent<Image>();
+                img.color = new Color(0.15f, 0.15f, 0.18f, 0.9f);
+                Button btn = backObj.AddComponent<Button>();
+                btn.onClick.AddListener(action);
+
+                RectTransform rt = backObj.GetComponent<RectTransform>();
+                rt.anchorMin = new Vector2(0f, 1f);
+                rt.anchorMax = new Vector2(0f, 1f);
+                rt.pivot = new Vector2(0f, 1f);
+                rt.anchoredPosition = new Vector2(40, -40);
+                rt.sizeDelta = new Vector2(180, 70);
+
+                GameObject textObj = new GameObject("Text (TMP)");
+                textObj.transform.SetParent(backObj.transform, false);
+                var tmp = textObj.AddComponent<TextMeshProUGUI>();
+                tmp.text = "← Back";
+                tmp.fontSize = 26;
+                tmp.alignment = TextAlignmentOptions.Center;
+                tmp.color = Color.white;
+                RectTransform textRt = textObj.GetComponent<RectTransform>();
+                textRt.anchorMin = Vector2.zero;
+                textRt.anchorMax = Vector2.one;
+                textRt.sizeDelta = Vector2.zero;
+            }
         }
 
         public void ShowModeSelect()
@@ -122,16 +279,25 @@ namespace ARNav.UI
             if (navigationPanel != null) navigationPanel.SetActive(false);
             if (feedbackPanel != null) feedbackPanel.SetActive(false);
 
-            // Automatically start recording path if user taps Record New Route
-            if (recorder != null && !recorder.IsRecording)
+            // Start recording cleanly
+            if (recorder != null)
             {
                 string startName = (startPointInput != null && !string.IsNullOrEmpty(startPointInput.text))
-                    ? startPointInput.text : "Location A";
+                    ? startPointInput.text : "Start Location";
                 recorder.StartRecording(startName);
             }
 
             if (recordingStatusText != null) 
-                recordingStatusText.text = "Walk along the route. Tap 'Finish & Save' when done.";
+                recordingStatusText.text = "🔴 Recording Route... Walk normally.\nTap 'Finish & Save' when done.";
+        }
+
+        public void CancelRecordingAndReturn()
+        {
+            if (recorder != null && recorder.IsRecording)
+            {
+                recorder.StopAndSaveRecording("Cancelled");
+            }
+            ShowModeSelect();
         }
 
         public void OpenNavigateMode()
@@ -143,12 +309,11 @@ namespace ARNav.UI
 
             RefreshGraphDestinations();
 
-            // Auto-navigate to latest destination if available
-            if (_cachedGraph != null && _cachedGraph.nodes.Count >= 2 && navigator != null && !navigator.IsNavigating)
+            if (navInstructionText != null)
             {
-                string startId = _cachedGraph.nodes[0].id;
-                string destId = _cachedGraph.nodes[_cachedGraph.nodes.Count - 1].id;
-                navigator.StartNavigation(startId, destId);
+                navInstructionText.text = (_cachedGraph != null && _cachedGraph.nodes.Count >= 2)
+                    ? "Select destination above & tap Start Navigation"
+                    : "No routes recorded yet. Please tap Back and Record a route first!";
             }
         }
 
@@ -372,7 +537,7 @@ namespace ARNav.UI
 
         private void AutoLayoutButtons()
         {
-            // Ensure ModeSelectPanel buttons are comfortably spaced on high-res mobile screens
+            // 1. Format ModeSelectPanel
             if (modeSelectPanel != null)
             {
                 var buttons = modeSelectPanel.GetComponentsInChildren<Button>(true);
@@ -383,25 +548,76 @@ namespace ARNav.UI
 
                     if (rt1 != null)
                     {
-                        rt1.sizeDelta = new Vector2(500, 120);
-                        rt1.anchoredPosition = new Vector2(0, 100);
+                        rt1.sizeDelta = new Vector2(540, 130);
+                        rt1.anchoredPosition = new Vector2(0, 120);
                     }
                     if (rt2 != null)
                     {
-                        rt2.sizeDelta = new Vector2(500, 120);
-                        rt2.anchoredPosition = new Vector2(0, -100);
+                        rt2.sizeDelta = new Vector2(540, 130);
+                        rt2.anchoredPosition = new Vector2(0, -80);
                     }
                 }
             }
 
-            // Ensure StopRecordButton is well sized and positioned near the bottom of screen
-            if (stopRecordButton != null)
+            // 2. Format RecordingPanel
+            if (recordingPanel != null)
             {
-                RectTransform rtStop = stopRecordButton.GetComponent<RectTransform>();
-                if (rtStop != null)
+                if (recordingStatusText != null)
                 {
-                    rtStop.sizeDelta = new Vector2(500, 120);
-                    rtStop.anchoredPosition = new Vector2(0, -250);
+                    RectTransform rtStatus = recordingStatusText.GetComponent<RectTransform>();
+                    rtStatus.anchorMin = new Vector2(0.5f, 1f);
+                    rtStatus.anchorMax = new Vector2(0.5f, 1f);
+                    rtStatus.pivot = new Vector2(0.5f, 1f);
+                    rtStatus.anchoredPosition = new Vector2(0, -120);
+                    rtStatus.sizeDelta = new Vector2(850, 200);
+                    recordingStatusText.alignment = TextAlignmentOptions.Center;
+                    recordingStatusText.fontSize = 32;
+                }
+
+                if (stopRecordButton != null)
+                {
+                    RectTransform rtStop = stopRecordButton.GetComponent<RectTransform>();
+                    rtStop.anchorMin = new Vector2(0.5f, 0f);
+                    rtStop.anchorMax = new Vector2(0.5f, 0f);
+                    rtStop.pivot = new Vector2(0.5f, 0f);
+                    rtStop.sizeDelta = new Vector2(540, 130);
+                    rtStop.anchoredPosition = new Vector2(0, 120);
+                }
+            }
+
+            // 3. Format NavigationPanel (Prevent any overlapping between instruction text, dropdown, and button)
+            if (navigationPanel != null)
+            {
+                if (navInstructionText != null)
+                {
+                    RectTransform rtInstruction = navInstructionText.GetComponent<RectTransform>();
+                    rtInstruction.anchorMin = new Vector2(0.5f, 1f);
+                    rtInstruction.anchorMax = new Vector2(0.5f, 1f);
+                    rtInstruction.pivot = new Vector2(0.5f, 1f);
+                    rtInstruction.anchoredPosition = new Vector2(0, -140);
+                    rtInstruction.sizeDelta = new Vector2(850, 200);
+                    navInstructionText.alignment = TextAlignmentOptions.Center;
+                    navInstructionText.fontSize = 32;
+                }
+
+                if (destinationDropdown != null)
+                {
+                    RectTransform rtDropdown = destinationDropdown.GetComponent<RectTransform>();
+                    rtDropdown.anchorMin = new Vector2(0.5f, 0.5f);
+                    rtDropdown.anchorMax = new Vector2(0.5f, 0.5f);
+                    rtDropdown.pivot = new Vector2(0.5f, 0.5f);
+                    rtDropdown.anchoredPosition = new Vector2(0, 80);
+                    rtDropdown.sizeDelta = new Vector2(650, 110);
+                }
+
+                if (startNavButton != null)
+                {
+                    RectTransform rtStart = startNavButton.GetComponent<RectTransform>();
+                    rtStart.anchorMin = new Vector2(0.5f, 0.5f);
+                    rtStart.anchorMax = new Vector2(0.5f, 0.5f);
+                    rtStart.pivot = new Vector2(0.5f, 0.5f);
+                    rtStart.anchoredPosition = new Vector2(0, -80);
+                    rtStart.sizeDelta = new Vector2(540, 130);
                 }
             }
         }

@@ -20,7 +20,7 @@ namespace ARNav.Navigation
 
         [Header("Movement Settings")]
         [SerializeField] private float stepLengthMeters = 0.68f; // Standard walking stride
-        [SerializeField] private float stepThreshold = 1.15f;    // Base acceleration peak threshold
+        [SerializeField] private float stepThreshold = 1.08f;    // Responsive acceleration peak threshold for walking
         
         [Header("State (Read Only)")]
         [SerializeField] private PhonePose _currentPose = PhonePose.Holding;
@@ -38,8 +38,8 @@ namespace ARNav.Navigation
         // ZUPT — Zero Velocity Update (Paper 3: IEEE Sensors 2022)
         // When the phone is completely still, stop ghost steps from vibrations.
         private float _stillnessTimer = 0f;
-        private const float ZUPT_STILL_THRESHOLD = 0.04f;  // Low variance = phone is on a desk
-        private const float ZUPT_STILL_SECONDS  = 0.8f;   // Must be still for this long to trigger ZUPT
+        private const float ZUPT_STILL_THRESHOLD = 0.025f; // Low variance = phone is stationary on desk
+        private const float ZUPT_STILL_SECONDS  = 0.6f;   // Refractory stillness time
 
         // 1D Kalman Filter state for heading angle (Paper 4: MDPI Sensors 2022)
         private float _kalmanHeadingAngle = 0f;
@@ -124,14 +124,21 @@ namespace ARNav.Navigation
         {
             if (cameraBackgroundUI == null)
             {
-                Canvas canvas = FindAnyObjectByType<Canvas>();
-                if (canvas == null) return;
+                // Create dedicated fullscreen background Canvas behind main UI
+                GameObject canvasObj = new GameObject("SensorAR_CameraCanvas");
+                Canvas bgCanvas = canvasObj.AddComponent<Canvas>();
+                bgCanvas.renderMode = RenderMode.ScreenSpaceOverlay;
+                bgCanvas.sortingOrder = -100; // Force behind all interactable UI
+                canvasObj.AddComponent<CanvasScaler>();
 
                 GameObject bgObj = new GameObject("SensorAR_VideoBackground");
-                bgObj.transform.SetParent(canvas.transform, false);
-                bgObj.transform.SetAsFirstSibling(); // Behind all UI buttons
+                bgObj.transform.SetParent(canvasObj.transform, false);
 
                 cameraBackgroundUI = bgObj.AddComponent<RawImage>();
+                RectTransform rt = cameraBackgroundUI.rectTransform;
+                rt.anchorMin = new Vector2(0.5f, 0.5f);
+                rt.anchorMax = new Vector2(0.5f, 0.5f);
+                rt.pivot = new Vector2(0.5f, 0.5f);
             }
 
             if (_webCamTexture != null && cameraBackgroundUI != null)
@@ -147,37 +154,29 @@ namespace ARNav.Navigation
             if (_webCamTexture == null || cameraBackgroundUI == null || _webCamTexture.width < 100) return;
 
             RectTransform rt = cameraBackgroundUI.rectTransform;
-            
-            // Center the RectTransform and set its size to the texture's resolution
-            rt.anchorMin = new Vector2(0.5f, 0.5f);
-            rt.anchorMax = new Vector2(0.5f, 0.5f);
-            rt.pivot = new Vector2(0.5f, 0.5f);
-            rt.sizeDelta = new Vector2(_webCamTexture.width, _webCamTexture.height);
-            rt.anchoredPosition = Vector2.zero;
 
-            // 1. Rotate to match sensor hardware angle
             int angle = _webCamTexture.videoRotationAngle;
             rt.localEulerAngles = new Vector3(0, 0, -angle);
 
-            // 2. Calculate scaling to cover the whole screen (Zoom to fill)
-            float videoWidth = _webCamTexture.width;
-            float videoHeight = _webCamTexture.height;
-            
-            // If rotated 90 or 270, the video's visual width and height are swapped
-            bool isPortrait = angle == 90 || angle == 270;
-            float visualVideoWidth = isPortrait ? videoHeight : videoWidth;
-            float visualVideoHeight = isPortrait ? videoWidth : videoHeight;
+            // Raw video dimensions
+            float vw = _webCamTexture.width;
+            float vh = _webCamTexture.height;
 
-            // Calculate ratios to fit the screen
-            float scaleX = (float)Screen.width / visualVideoWidth;
-            float scaleY = (float)Screen.height / visualVideoHeight;
+            // In portrait (angle 90 or 270), width and height swap relative to screen
+            bool isPortrait = (angle == 90 || angle == 270);
+            float effectiveVw = isPortrait ? vh : vw;
+            float effectiveVh = isPortrait ? vw : vh;
 
-            // To ensure it covers the whole screen without stretching, use the maximum of the two scales
-            float scale = Mathf.Max(scaleX, scaleY);
+            float screenW = Screen.width;
+            float screenH = Screen.height;
 
-            // 3. Fix inverted / flipped mirror axis
+            // Aspect fill: pick largest ratio so screen is 100% covered, zero black bars
+            float scale = Mathf.Max(screenW / effectiveVw, screenH / effectiveVh);
+
+            rt.sizeDelta = new Vector2(vw, vh);
+            rt.anchoredPosition = Vector2.zero;
+
             float mirrorY = _webCamTexture.videoVerticallyMirrored ? -1.0f : 1.0f;
-
             rt.localScale = new Vector3(scale, scale * mirrorY, 1.0f);
         }
 

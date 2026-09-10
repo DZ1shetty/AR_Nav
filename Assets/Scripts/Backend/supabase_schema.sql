@@ -116,7 +116,12 @@ CREATE POLICY "Public read buildings" ON buildings FOR SELECT USING (true);
 CREATE POLICY "Public read nodes" ON graph_nodes FOR SELECT USING (true);
 CREATE POLICY "Public read edges" ON graph_edges FOR SELECT USING (true);
 
--- Allow inserting crowdsourced routes anonymously
+-- Allow inserting and updating crowdsourced routes anonymously (Required for PostgREST UPSERT resolution=merge-duplicates)
 CREATE POLICY "Public insert nodes" ON graph_nodes FOR INSERT WITH CHECK (true);
+CREATE POLICY "Public update nodes" ON graph_nodes FOR UPDATE USING (true) WITH CHECK (true);
+
 CREATE POLICY "Public insert edges" ON graph_edges FOR INSERT WITH CHECK (true);
+CREATE POLICY "Public update edges" ON graph_edges FOR UPDATE USING (true) WITH CHECK (true);
+
 CREATE POLICY "Public insert raw walks" ON raw_walk_submissions FOR INSERT WITH CHECK (true);
+

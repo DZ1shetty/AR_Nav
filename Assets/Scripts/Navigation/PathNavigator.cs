@@ -108,6 +108,19 @@ namespace ARNav.Navigation
             }
 
             _currentPointIndex = 0;
+            // If user is already standing right at the start waypoint, advance to point 1 so it doesn't instantly finish
+            if (_flattenedRoutePoints.Count > 1 && arCamera != null)
+            {
+                float distToStart = Vector2.Distance(
+                    new Vector2(arCamera.position.x, arCamera.position.z),
+                    new Vector2(_flattenedRoutePoints[0].x, _flattenedRoutePoints[0].z)
+                );
+                if (distToStart <= waypointReachRadius)
+                {
+                    _currentPointIndex = 1;
+                }
+            }
+
             _isNavigating = true;
 
             RenderPathLine();
@@ -130,19 +143,22 @@ namespace ARNav.Navigation
 
             if (groundDistance <= waypointReachRadius)
             {
-                _currentPointIndex++;
-                if (_currentPointIndex >= _flattenedRoutePoints.Count)
+                // Advance to next waypoint
+                if (_currentPointIndex < _flattenedRoutePoints.Count - 1)
                 {
-                    // Reached destination!
+                    _currentPointIndex++;
+                    RenderPathLine();
+                    UpdateGuidanceText();
+                }
+                else
+                {
+                    // Reached final destination!
                     _isNavigating = false;
                     pathLineRenderer.positionCount = 0;
                     OnInstructionChanged?.Invoke("You have arrived at your destination! 🎉");
                     OnDestinationReached?.Invoke();
                     return;
                 }
-
-                RenderPathLine();
-                UpdateGuidanceText();
             }
             else
             {
