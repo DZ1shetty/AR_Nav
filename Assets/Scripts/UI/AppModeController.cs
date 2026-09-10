@@ -117,6 +117,7 @@ namespace ARNav.UI
             }
 
             WireAllPanels();
+            EnsureStartRecordButton();   // add button programmatically if scene is missing it
             StartCoroutine(InitAR());
         }
 
@@ -514,6 +515,49 @@ namespace ARNav.UI
             if (recordingStatusText != null) recordingStatusText.text = msg;
         }
 
+        /// <summary>
+        /// If the scene's RecordingPanel has no "Start Recording" button
+        /// (e.g. hand-built scenes that only have a Stop button), this creates
+        /// one programmatically so recording can always be started.
+        /// </summary>
+        private void EnsureStartRecordButton()
+        {
+            if (startRecordButton != null || recordingPanel == null) return;
+
+            Debug.Log("[AppModeController] No Start Recording button found — creating one.");
+
+            GameObject btnGO = new GameObject("StartRecordingBtn");
+            btnGO.transform.SetParent(recordingPanel.transform, false);
+
+            UnityEngine.UI.Image img = btnGO.AddComponent<UnityEngine.UI.Image>();
+            img.color = new Color(0.1f, 0.55f, 0.1f, 0.95f);
+
+            startRecordButton = btnGO.AddComponent<UnityEngine.UI.Button>();
+            startRecordButton.onClick.AddListener(OnStartRecordClicked);
+
+            RectTransform rt = btnGO.GetComponent<RectTransform>();
+            rt.anchorMin = rt.anchorMax = new Vector2(0.5f, 0f);
+            rt.pivot     = new Vector2(0.5f, 0f);
+            rt.anchoredPosition = new Vector2(0f, 240f);
+            rt.sizeDelta        = new Vector2(540f, 110f);
+
+            // Label
+            GameObject labelGO = new GameObject("Label");
+            labelGO.transform.SetParent(btnGO.transform, false);
+            var tmp = labelGO.AddComponent<TMPro.TextMeshProUGUI>();
+            tmp.text      = "▶  Start Recording";
+            tmp.fontSize  = 30;
+            tmp.color     = Color.white;
+            tmp.alignment = TMPro.TextAlignmentOptions.Center;
+            RectTransform lrt = labelGO.GetComponent<RectTransform>();
+            lrt.anchorMin = Vector2.zero;
+            lrt.anchorMax = Vector2.one;
+            lrt.sizeDelta = Vector2.zero;
+            lrt.anchoredPosition = Vector2.zero;
+
+            // Disable stop button until recording starts
+            if (stopRecordButton != null) stopRecordButton.interactable = false;
+        }
         private void SetNavInstruction(string msg)
         {
             if (navInstructionText != null) navInstructionText.text = msg;

@@ -28,6 +28,12 @@ public class ArrowMeshBuilder : MonoBehaviour
 
     private void Awake()
     {
+        // Ensure required components exist before touching them.
+        // This prevents the "Creating missing MeshRenderer component" warning
+        // on prefabs that were saved before these RequireComponents were added.
+        if (GetComponent<MeshFilter>()   == null) gameObject.AddComponent<MeshFilter>();
+        if (GetComponent<MeshRenderer>() == null) gameObject.AddComponent<MeshRenderer>();
+
         BuildMesh();
         ApplyMaterial();
         AddARArrow();

@@ -11,7 +11,8 @@ using UnityEngine;
 /// FIX: _baseY is now refreshed every time the object is placed/moved via
 /// RefreshBase(), so the bob always oscillates around the correct world Y.
 /// </summary>
-[RequireComponent(typeof(Renderer))]
+[RequireComponent(typeof(MeshFilter))]
+[RequireComponent(typeof(MeshRenderer))]
 public class ARArrow : MonoBehaviour
 {
     [Header("Fade")]
